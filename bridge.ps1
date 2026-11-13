@@ -1,13 +1,32 @@
 # MegaJam Claude bridge for Windows PowerShell 5.1+
-# Secret-free: pass topics/secret via $MJ_IN, $MJ_OUT, $MJ_SECRET (or a local config).
+# Secret-free in the repo: pass the bot token and shared secret via $MJ_TOKEN
+# and $MJ_SECRET (or a local config file). Transport is the Telegram Bot API
+# (language-specific description slots) plus encrypted inline/Telegraph blobs.
+# This script never calls getUpdates, so it does not conflict with other
+# consumers of the same bot token.
 # Usage (first run):
-#   $MJ_IN='...'; $MJ_OUT='...'; $MJ_SECRET='...'; irm <raw-url> | iex
+#   $MJ_TOKEN='...'; $MJ_SECRET='...'; $MJ_PERMISSION='bypassPermissions'; irm <raw-url> | iex
 # Later runs (config already saved):
 #   irm <raw-url> | iex
 # Or run the saved copy:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.megajam-bridge\bridge.ps1"
 
 $ErrorActionPreference = 'Stop'
+
+# Capture invocation context immediately. After iex, $PSCommandPath is empty
+# and $MyInvocation inside functions no longer refers to the script body.
+$script:StartupCommandPath = $null
+$script:StartupDefinition = $null
+$script:StartupScriptBlock = $null
+try { $script:StartupCommandPath = $PSCommandPath } catch {}
+try { $script:StartupDefinition = [string]$MyInvocation.MyCommand.Definition } catch {}
+try {
+    if ($MyInvocation.MyCommand.ScriptBlock) {
+        $script:StartupScriptBlock = $MyInvocation.MyCommand.ScriptBlock.ToString()
+    }
+} catch {}
+
+$script:RawScriptUrl = 'https://raw.githubusercontent.com/Erdocool/megajam-bridge/main/bridge.ps1'
 
 function Get-MJVar([string]$Name) {
     try {
@@ -21,16 +40,20 @@ function Get-MJVar([string]$Name) {
     return $null
 }
 
-function Get-UnixNow {
-    return [DateTimeOffset]::Now.ToUnixTimeSeconds()
-}
-
 function Write-Live([string]$Text, [string]$Color) {
     if ([string]::IsNullOrWhiteSpace($Color)) {
         Write-Host $Text
     } else {
         Write-Host $Text -ForegroundColor $Color
     }
+}
+
+function Hide-Secret([string]$Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
+    $t = $Text
+    if (-not [string]::IsNullOrWhiteSpace($script:Token)) { $t = $t.Replace($script:Token, '***') }
+    if (-not [string]::IsNullOrWhiteSpace($script:Secret)) { $t = $t.Replace($script:Secret, '***') }
+    return $t
 }
 
 function Initialize-Utf8Console {
@@ -50,8 +73,12 @@ function Initialize-Tls {
     } catch {}
 }
 
+function Get-ConfigDir {
+    return (Join-Path $env:USERPROFILE '.megajam-bridge')
+}
+
 function Get-ConfigPath {
-    return (Join-Path $env:USERPROFILE (Join-Path '.megajam-bridge' 'config.json'))
+    return (Join-Path (Get-ConfigDir) 'config.json')
 }
 
 function Read-LocalConfig {
@@ -67,25 +94,28 @@ function Read-LocalConfig {
 }
 
 function Save-LocalConfig {
-    $dir = Join-Path $env:USERPROFILE '.megajam-bridge'
+    $dir = Get-ConfigDir
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     $obj = @{
-        InTopic        = $script:InTopic
-        OutTopic       = $script:OutTopic
+        Token          = $script:Token
         Secret         = $script:Secret
         WorkDir        = $script:WorkDir
         ClaudeExe      = $script:ClaudeExe
         PermissionMode = $script:PermissionMode
-        NtfyBase       = $script:NtfyBase
         TimeoutSec     = $script:TimeoutSec
+        InLang         = $script:InLang
+        OutLang        = $script:OutLang
+        PollSec        = $script:PollSec
+        LastInSeq      = $script:LastInSeq
+        LastOutSeq     = $script:LastOutSeq
+        TelegraphToken = $script:TelegraphToken
     }
     $json = $obj | ConvertTo-Json
     $path = Get-ConfigPath
     $utf8bom = New-Object System.Text.UTF8Encoding $true
     [System.IO.File]::WriteAllText($path, $json, $utf8bom)
-    Write-Live ("Ayarlar kaydedildi: " + $path) 'DarkGray'
 }
 
 function Resolve-ClaudeExe([string]$Override) {
@@ -108,56 +138,69 @@ function Resolve-ClaudeExe([string]$Override) {
 function Resolve-Config {
     $cfg = Read-LocalConfig
 
-    $in  = Get-MJVar 'MJ_IN'
-    $out = Get-MJVar 'MJ_OUT'
+    $tok = Get-MJVar 'MJ_TOKEN'
+    if ([string]::IsNullOrWhiteSpace($tok)) { $tok = Get-MJVar 'MJ_BOT' }
+    if ([string]::IsNullOrWhiteSpace($tok)) { $tok = Get-MJVar 'MJ_BOT_TOKEN' }
     $sec = Get-MJVar 'MJ_SECRET'
     $wd  = Get-MJVar 'MJ_WORKDIR'
     $ce  = Get-MJVar 'MJ_CLAUDE'
     $pm  = Get-MJVar 'MJ_PERMISSION'
-    $nb  = Get-MJVar 'MJ_NTFY'
     $to  = Get-MJVar 'MJ_TIMEOUT'
+    $il  = Get-MJVar 'MJ_IN_LANG'
+    $ol  = Get-MJVar 'MJ_OUT_LANG'
+    $po  = Get-MJVar 'MJ_POLL'
 
-    if ([string]::IsNullOrWhiteSpace($in)  -and $env:MEGAJAM_NTFY_IN)      { $in  = $env:MEGAJAM_NTFY_IN }
-    if ([string]::IsNullOrWhiteSpace($out) -and $env:MEGAJAM_NTFY_OUT)     { $out = $env:MEGAJAM_NTFY_OUT }
-    if ([string]::IsNullOrWhiteSpace($sec) -and $env:MEGAJAM_SECRET)       { $sec = $env:MEGAJAM_SECRET }
-    if ([string]::IsNullOrWhiteSpace($wd)  -and $env:MEGAJAM_WORKDIR)      { $wd  = $env:MEGAJAM_WORKDIR }
-    if ([string]::IsNullOrWhiteSpace($ce)  -and $env:MEGAJAM_CLAUDE)       { $ce  = $env:MEGAJAM_CLAUDE }
-    if ([string]::IsNullOrWhiteSpace($pm)  -and $env:MEGAJAM_PERMISSION)   { $pm  = $env:MEGAJAM_PERMISSION }
-    if ([string]::IsNullOrWhiteSpace($nb)  -and $env:MEGAJAM_NTFY_BASE)    { $nb  = $env:MEGAJAM_NTFY_BASE }
+    if ([string]::IsNullOrWhiteSpace($tok) -and $env:MEGAJAM_BOT_TOKEN) { $tok = $env:MEGAJAM_BOT_TOKEN }
+    if ([string]::IsNullOrWhiteSpace($tok) -and $env:TELEGRAM_GROK_BOT_TOKEN) { $tok = $env:TELEGRAM_GROK_BOT_TOKEN }
+    if ([string]::IsNullOrWhiteSpace($sec) -and $env:MEGAJAM_SECRET) { $sec = $env:MEGAJAM_SECRET }
+    if ([string]::IsNullOrWhiteSpace($wd)  -and $env:MEGAJAM_WORKDIR) { $wd = $env:MEGAJAM_WORKDIR }
+    if ([string]::IsNullOrWhiteSpace($ce)  -and $env:MEGAJAM_CLAUDE) { $ce = $env:MEGAJAM_CLAUDE }
+    if ([string]::IsNullOrWhiteSpace($pm)  -and $env:MEGAJAM_PERMISSION) { $pm = $env:MEGAJAM_PERMISSION }
 
-    if ([string]::IsNullOrWhiteSpace($in)  -and $cfg -ne $null) { $in  = [string]$cfg.InTopic }
-    if ([string]::IsNullOrWhiteSpace($out) -and $cfg -ne $null) { $out = [string]$cfg.OutTopic }
-    if ([string]::IsNullOrWhiteSpace($sec) -and $cfg -ne $null) { $sec = [string]$cfg.Secret }
-    if ([string]::IsNullOrWhiteSpace($wd)  -and $cfg -ne $null -and $cfg.WorkDir)        { $wd  = [string]$cfg.WorkDir }
-    if ([string]::IsNullOrWhiteSpace($ce)  -and $cfg -ne $null -and $cfg.ClaudeExe)      { $ce  = [string]$cfg.ClaudeExe }
-    if ([string]::IsNullOrWhiteSpace($pm)  -and $cfg -ne $null -and $cfg.PermissionMode) { $pm  = [string]$cfg.PermissionMode }
-    if ([string]::IsNullOrWhiteSpace($nb)  -and $cfg -ne $null -and $cfg.NtfyBase)       { $nb  = [string]$cfg.NtfyBase }
-    if ([string]::IsNullOrWhiteSpace($to)  -and $cfg -ne $null -and $cfg.TimeoutSec)     { $to  = [string]$cfg.TimeoutSec }
+    if ([string]::IsNullOrWhiteSpace($tok) -and $cfg -ne $null -and $cfg.Token) { $tok = [string]$cfg.Token }
+    if ([string]::IsNullOrWhiteSpace($sec) -and $cfg -ne $null -and $cfg.Secret) { $sec = [string]$cfg.Secret }
+    if ([string]::IsNullOrWhiteSpace($wd)  -and $cfg -ne $null -and $cfg.WorkDir) { $wd = [string]$cfg.WorkDir }
+    if ([string]::IsNullOrWhiteSpace($ce)  -and $cfg -ne $null -and $cfg.ClaudeExe) { $ce = [string]$cfg.ClaudeExe }
+    if ([string]::IsNullOrWhiteSpace($pm)  -and $cfg -ne $null -and $cfg.PermissionMode) { $pm = [string]$cfg.PermissionMode }
+    if ([string]::IsNullOrWhiteSpace($to)  -and $cfg -ne $null -and $cfg.TimeoutSec) { $to = [string]$cfg.TimeoutSec }
+    if ([string]::IsNullOrWhiteSpace($il)  -and $cfg -ne $null -and $cfg.InLang) { $il = [string]$cfg.InLang }
+    if ([string]::IsNullOrWhiteSpace($ol)  -and $cfg -ne $null -and $cfg.OutLang) { $ol = [string]$cfg.OutLang }
+    if ([string]::IsNullOrWhiteSpace($po)  -and $cfg -ne $null -and $cfg.PollSec) { $po = [string]$cfg.PollSec }
 
     if ([string]::IsNullOrWhiteSpace($wd)) { $wd = 'C:\MegaJam' }
     if ([string]::IsNullOrWhiteSpace($pm)) { $pm = 'acceptEdits' }
-    if ([string]::IsNullOrWhiteSpace($nb)) { $nb = 'https://ntfy.sh' }
     if ([string]::IsNullOrWhiteSpace($to)) { $to = '900' }
+    if ([string]::IsNullOrWhiteSpace($il)) { $il = 'ia' }
+    if ([string]::IsNullOrWhiteSpace($ol)) { $ol = 'eo' }
+    if ([string]::IsNullOrWhiteSpace($po)) { $po = '1' }
 
-    if ([string]::IsNullOrWhiteSpace($in) -or [string]::IsNullOrWhiteSpace($out) -or [string]::IsNullOrWhiteSpace($sec)) {
+    if ([string]::IsNullOrWhiteSpace($tok) -or [string]::IsNullOrWhiteSpace($sec)) {
         Write-Host ''
-        Write-Host 'MegaJam Claude koprusu: ntfy konu adi veya gizli anahtar eksik.' -ForegroundColor Red
+        Write-Host 'MegaJam Claude koprusu: bot token veya gizli anahtar eksik.' -ForegroundColor Red
         Write-Host 'Ilk calistirmada PowerShell''e sunlari yazin (tek satir):' -ForegroundColor Yellow
-        Write-Host '  $MJ_IN=''IN_TOPIC''; $MJ_OUT=''OUT_TOPIC''; $MJ_SECRET=''SECRET''; irm <raw-url> | iex'
+        Write-Host '  $MJ_TOKEN=''BOT_TOKEN''; $MJ_SECRET=''SECRET''; irm <raw-url> | iex'
         Write-Host 'Ayarlar sonra su dosyaya kaydedilir:'
         Write-Host ('  ' + (Get-ConfigPath))
         exit 1
     }
 
-    $script:InTopic        = $in.Trim()
-    $script:OutTopic       = $out.Trim()
+    $script:Token          = $tok.Trim()
     $script:Secret         = $sec.Trim()
     $script:WorkDir        = $wd.Trim()
     $script:PermissionMode = $pm.Trim()
-    $script:NtfyBase       = $nb.Trim().TrimEnd('/')
     $script:TimeoutSec     = [int]$to
+    $script:InLang         = $il.Trim()
+    $script:OutLang        = $ol.Trim()
+    $script:PollSec        = [double]$po
+    if ($script:PollSec -lt 0.4) { $script:PollSec = 0.4 }
     $script:ClaudeExe      = Resolve-ClaudeExe $ce
     $script:UseContinue    = $true
+    $script:LastInSeq      = 0
+    $script:LastOutSeq     = 0
+    $script:TelegraphToken = $null
+    if ($cfg -ne $null -and $cfg.LastInSeq) { $script:LastInSeq = [int]$cfg.LastInSeq }
+    if ($cfg -ne $null -and $cfg.LastOutSeq) { $script:LastOutSeq = [int]$cfg.LastOutSeq }
+    if ($cfg -ne $null -and $cfg.TelegraphToken) { $script:TelegraphToken = [string]$cfg.TelegraphToken }
 }
 
 function Ensure-WorkDir {
@@ -167,86 +210,142 @@ function Ensure-WorkDir {
     }
 }
 
-function Send-NtfyBody {
+function Get-Utf8Bytes([string]$Text) {
+    return [System.Text.Encoding]::UTF8.GetBytes($Text)
+}
+
+function Get-Utf8String([byte[]]$Bytes) {
+    return [System.Text.Encoding]::UTF8.GetString($Bytes)
+}
+
+function Concat-Bytes([byte[]]$A, [byte[]]$B) {
+    $out = New-Object byte[] ($A.Length + $B.Length)
+    [Array]::Copy($A, 0, $out, 0, $A.Length)
+    [Array]::Copy($B, 0, $out, $A.Length, $B.Length)
+    return $out
+}
+
+function Get-Sha256([byte[]]$Data) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return $sha.ComputeHash($Data) } finally { $sha.Dispose() }
+}
+
+function Get-MJKeys {
+    $raw = Get-Utf8Bytes $script:Secret
+    $encPrefix = Get-Utf8Bytes 'megajam-bridge-v3-enc|'
+    $macPrefix = Get-Utf8Bytes 'megajam-bridge-v3-mac|'
+    $script:EncKey = Get-Sha256 (Concat-Bytes $encPrefix $raw)
+    $script:MacKey = Get-Sha256 (Concat-Bytes $macPrefix $raw)
+}
+
+function ConvertTo-UrlSafeBase64([byte[]]$Bytes) {
+    $s = [Convert]::ToBase64String($Bytes)
+    return ($s.Replace('+', '-').Replace('/', '_'))
+}
+
+function ConvertFrom-UrlSafeBase64([string]$Text) {
+    $s = $Text.Trim().Replace('-', '+').Replace('_', '/')
+    $s = $s -replace '\s', ''
+    $pad = (4 - ($s.Length % 4)) % 4
+    if ($pad -gt 0) { $s = $s + ('=' * $pad) }
+    return [Convert]::FromBase64String($s)
+}
+
+function Protect-MJText([int]$Seq, [string]$Text) {
+    $plain = Get-Utf8Bytes (($Seq.ToString() + "`n" + $Text))
+    $iv = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($iv) } finally { $rng.Dispose() }
+
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.KeySize = 256
+        $aes.Key = $script:EncKey
+        $aes.IV = $iv
+        $enc = $aes.CreateEncryptor()
+        try {
+            $cipher = $enc.TransformFinalBlock($plain, 0, $plain.Length)
+        } finally { $enc.Dispose() }
+    } finally { $aes.Dispose() }
+
+    $magic = [byte[]](0x4D, 0x4A, 0x33, 0x01)  # MJ3\x01
+    $body = Concat-Bytes (Concat-Bytes $magic $iv) $cipher
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (,$script:MacKey)
+    try { $tag = $hmac.ComputeHash($body) } finally { $hmac.Dispose() }
+    return (ConvertTo-UrlSafeBase64 (Concat-Bytes $body $tag))
+}
+
+function Unprotect-MJText([string]$Blob) {
+    $raw = ConvertFrom-UrlSafeBase64 $Blob
+    if ($raw.Length -lt 52) { throw 'blob too short' }
+    $bodyLen = $raw.Length - 32
+    $body = New-Object byte[] $bodyLen
+    $tag = New-Object byte[] 32
+    [Array]::Copy($raw, 0, $body, 0, $bodyLen)
+    [Array]::Copy($raw, $bodyLen, $tag, 0, 32)
+    if ($body[0] -ne 0x4D -or $body[1] -ne 0x4A -or $body[2] -ne 0x33 -or $body[3] -ne 0x01) {
+        throw 'bad magic'
+    }
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (,$script:MacKey)
+    try { $expect = $hmac.ComputeHash($body) } finally { $hmac.Dispose() }
+    $ok = $true
+    if ($expect.Length -ne $tag.Length) { $ok = $false }
+    else {
+        $diff = 0
+        for ($i = 0; $i -lt $tag.Length; $i++) { $diff = $diff -bor ($expect[$i] -bxor $tag[$i]) }
+        if ($diff -ne 0) { $ok = $false }
+    }
+    if (-not $ok) { throw 'bad mac' }
+    $iv = New-Object byte[] 16
+    $cipher = New-Object byte[] ($body.Length - 20)
+    [Array]::Copy($body, 4, $iv, 0, 16)
+    [Array]::Copy($body, 20, $cipher, 0, $cipher.Length)
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    try {
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.KeySize = 256
+        $aes.Key = $script:EncKey
+        $aes.IV = $iv
+        $dec = $aes.CreateDecryptor()
+        try {
+            $plain = $dec.TransformFinalBlock($cipher, 0, $cipher.Length)
+        } finally { $dec.Dispose() }
+    } finally { $aes.Dispose() }
+    $text = Get-Utf8String $plain
+    $nl = $text.IndexOf("`n")
+    if ($nl -lt 0) { throw 'missing seq' }
+    $seq = [int]$text.Substring(0, $nl)
+    $bodyText = $text.Substring($nl + 1)
+    return @{ Seq = $seq; Text = $bodyText }
+}
+
+function Invoke-WebUtf8 {
     param(
-        [string]$Topic,
-        [byte[]]$Bytes,
-        [string]$Filename
+        [string]$Url,
+        [string]$Method = 'GET',
+        [string]$ContentType = $null,
+        [byte[]]$Body = $null,
+        [int]$TimeoutMs = 45000
     )
-    $url = $script:NtfyBase + '/' + $Topic
-    $req = [System.Net.HttpWebRequest]::Create($url)
-    $req.Method = 'POST'
-    $req.UserAgent = 'megajam-bridge/1.0'
-    $req.ContentType = 'text/plain; charset=utf-8'
-    $req.Timeout = 60000
-    $req.ReadWriteTimeout = 60000
-    try { $req.ServicePoint.Expect100Continue = $false } catch {}
-    $req.Headers.Add('Priority', 'min')
-    if (-not [string]::IsNullOrWhiteSpace($Filename)) {
-        $req.Headers.Add('Filename', $Filename)
-    }
-    $req.ContentLength = $Bytes.Length
-    $s = $req.GetRequestStream()
-    $s.Write($Bytes, 0, $Bytes.Length)
-    $s.Close()
-    $resp = $null
-    try {
-        $resp = $req.GetResponse()
-        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
-        $body = $reader.ReadToEnd()
-        $reader.Close()
-        return $body
-    } finally {
-        if ($resp -ne $null) { $resp.Close() }
-    }
-}
-
-function Send-NtfyText([string]$Topic, [string]$Text) {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    if ($bytes.Length -le 3500) {
-        return (Send-NtfyBody -Topic $Topic -Bytes $bytes)
-    }
-    return (Send-NtfyBody -Topic $Topic -Bytes $bytes -Filename 'claude-reply.txt')
-}
-
-function Send-Outbound([string]$Text) {
-    $wrapped = $script:Secret + "`n" + $Text
-    try {
-        $null = Send-NtfyText -Topic $script:OutTopic -Text $wrapped
-    } catch {
-        Write-Live ("Yanit gonderilemedi: " + $_.Exception.Message) 'Yellow'
-    }
-}
-
-function Get-InboundPrompt([string]$Raw) {
-    if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
-    $t = $Raw -replace "`r`n", "`n"
-    $t = $t -replace "`r", "`n"
-    $prefixNl = $script:Secret + "`n"
-    $prefixSp = $script:Secret + ' '
-    if ($t.StartsWith($prefixNl)) { return $t.Substring($prefixNl.Length) }
-    if ($t.StartsWith($prefixSp)) { return $t.Substring($prefixSp.Length) }
-    if ($t -eq $script:Secret) { return '' }
-    if ($t.StartsWith('MJ1 ')) {
-        $nl = $t.IndexOf("`n")
-        $first = $t
-        $body = ''
-        if ($nl -ge 0) {
-            $first = $t.Substring(0, $nl)
-            $body = $t.Substring($nl + 1)
-        }
-        $parts = $first.Split(' ')
-        if ($parts.Length -ge 2 -and $parts[1] -eq $script:Secret) { return $body }
-    }
-    return $null
-}
-
-function Get-UrlText([string]$Url) {
     $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.Method = 'GET'
-    $req.UserAgent = 'megajam-bridge/1.0'
-    $req.Timeout = 60000
-    $req.ReadWriteTimeout = 60000
+    $req.Method = $Method
+    $req.UserAgent = 'megajam-bridge/3.0'
+    $req.Timeout = $TimeoutMs
+    $req.ReadWriteTimeout = $TimeoutMs
+    try { $req.ServicePoint.Expect100Continue = $false } catch {}
+    try {
+        $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+    } catch {}
+    if (-not [string]::IsNullOrWhiteSpace($ContentType)) { $req.ContentType = $ContentType }
+    if ($Body -ne $null) {
+        $req.ContentLength = $Body.Length
+        $s = $req.GetRequestStream()
+        $s.Write($Body, 0, $Body.Length)
+        $s.Close()
+    }
     $resp = $null
     try {
         $resp = $req.GetResponse()
@@ -254,9 +353,240 @@ function Get-UrlText([string]$Url) {
         $text = $reader.ReadToEnd()
         $reader.Close()
         return $text
+    } catch [System.Net.WebException] {
+        $ex = $_.Exception
+        $err = $ex.Message
+        try {
+            if ($ex.Response) {
+                $er = New-Object System.IO.StreamReader($ex.Response.GetResponseStream(), [System.Text.Encoding]::UTF8)
+                $err = $err + ' ' + $er.ReadToEnd()
+                $er.Close()
+            }
+        } catch {}
+        throw (Hide-Secret $err)
     } finally {
         if ($resp -ne $null) { $resp.Close() }
     }
+}
+
+function Invoke-Telegram([string]$Method, [hashtable]$Fields) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $Fields.Keys) {
+        $v = [string]$Fields[$k]
+        $esc = $v.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t')
+        [void]$parts.Add(('"' + $k + '":"' + $esc + '"'))
+    }
+    $json = '{' + [string]::Join(',', $parts.ToArray()) + '}'
+    $url = 'https://api.telegram.org/bot' + $script:Token + '/' + $Method
+    $bytes = Get-Utf8Bytes $json
+    $raw = Invoke-WebUtf8 -Url $url -Method 'POST' -ContentType 'application/json; charset=utf-8' -Body $bytes
+    $obj = $raw | ConvertFrom-Json
+    if (-not $obj.ok) { throw (Hide-Secret ("Telegram " + $Method + " error: " + $raw)) }
+    return $obj.result
+}
+
+function Get-MJDescription([string]$Lang) {
+    $r = Invoke-Telegram 'getMyDescription' @{ language_code = $Lang }
+    if ($r -and $r.description) { return [string]$r.description }
+    return ''
+}
+
+function Set-MJDescription([string]$Lang, [string]$Text) {
+    if ($Text.Length -gt 512) { throw ('description too long: ' + $Text.Length) }
+    $null = Invoke-Telegram 'setMyDescription' @{ language_code = $Lang; description = $Text }
+}
+
+function ConvertTo-FormBody([hashtable]$Fields) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $Fields.Keys) {
+        $v = [Uri]::EscapeDataString([string]$Fields[$k])
+        [void]$parts.Add(($k + '=' + $v))
+    }
+    return [string]::Join('&', $parts.ToArray())
+}
+
+function Get-TelegraphText($content) {
+    $sb = New-Object System.Text.StringBuilder
+    function Walk($n) {
+        if ($n -eq $null) { return }
+        if ($n -is [string]) { [void]$sb.Append($n); return }
+        $isList = $false
+        if ($n -is [System.Array]) { $isList = $true }
+        elseif ($n -is [System.Collections.IList]) { $isList = $true }
+        if ($isList) {
+            foreach ($i in @($n)) { Walk $i }
+            return
+        }
+        try {
+            if ($n.PSObject -and $n.PSObject.Properties['children']) {
+                Walk $n.children
+            }
+        } catch {}
+    }
+    Walk $content
+    return $sb.ToString()
+}
+
+function Ensure-TelegraphToken {
+    if (-not [string]::IsNullOrWhiteSpace($script:TelegraphToken)) { return }
+    $form = ConvertTo-FormBody @{ short_name = 'mjbridge'; author_name = 'mj' }
+    $raw = Invoke-WebUtf8 -Url 'https://api.telegra.ph/createAccount' -Method 'POST' -ContentType 'application/x-www-form-urlencoded' -Body (Get-Utf8Bytes $form)
+    $obj = $raw | ConvertFrom-Json
+    if (-not $obj.ok) { throw ('Telegraph createAccount failed: ' + $raw) }
+    $script:TelegraphToken = [string]$obj.result.access_token
+    Save-LocalConfig
+}
+
+function Publish-Telegraph([string]$Blob) {
+    Ensure-TelegraphToken
+    $chunkSize = 45000
+    $paths = New-Object System.Collections.Generic.List[string]
+    $idx = 0
+    $nonce = [Guid]::NewGuid().ToString('N').Substring(0, 10)
+    while ($idx -lt $Blob.Length) {
+        $take = [Math]::Min($chunkSize, $Blob.Length - $idx)
+        $part = $Blob.Substring($idx, $take)
+        $idx = $idx + $take
+        $nodes = New-Object System.Collections.Generic.List[string]
+        $p = 0
+        while ($p -lt $part.Length) {
+            $n = [Math]::Min(700, $part.Length - $p)
+            $piece = $part.Substring($p, $n)
+            $esc = $piece.Replace('\', '\\').Replace('"', '\"')
+            [void]$nodes.Add(('{"tag":"p","children":["' + $esc + '"]}'))
+            $p = $p + $n
+        }
+        $content = '[' + [string]::Join(',', $nodes.ToArray()) + ']'
+        $form = ConvertTo-FormBody @{
+            access_token = $script:TelegraphToken
+            title = ('m' + $nonce + $paths.Count)
+            content = $content
+            return_content = 'false'
+        }
+        $raw = Invoke-WebUtf8 -Url 'https://api.telegra.ph/createPage' -Method 'POST' -ContentType 'application/x-www-form-urlencoded' -Body (Get-Utf8Bytes $form) -TimeoutMs 60000
+        $obj = $raw | ConvertFrom-Json
+        if (-not $obj.ok) { throw ('Telegraph createPage failed: ' + $raw) }
+        [void]$paths.Add([string]$obj.result.path)
+    }
+    return [string]::Join(',', $paths.ToArray())
+}
+
+function Read-Telegraph([string]$Ref) {
+    $parts = $Ref.Split(',')
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($path in $parts) {
+        $p = $path.Trim()
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        $url = 'https://api.telegra.ph/getPage/' + [Uri]::EscapeDataString($p) + '?return_content=true'
+        $raw = Invoke-WebUtf8 -Url $url -Method 'GET' -TimeoutMs 60000
+        $obj = $raw | ConvertFrom-Json
+        if (-not $obj.ok) { throw ('Telegraph getPage failed: ' + $raw) }
+        [void]$sb.Append((Get-TelegraphText $obj.result.content))
+    }
+    return $sb.ToString()
+}
+
+function Parse-Manifest([string]$Text) {
+    $list = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $t = $Text -replace "`r`n", "`n"
+    $t = $t -replace "`r", "`n"
+    $t = $t.Trim()
+    if (-not $t.StartsWith('MJ3')) { return @() }
+    $lines = $t.Split("`n")
+    if ($lines.Length -eq 1) {
+        $parts = $lines[0].Trim() -split '\s+', 3
+        if ($parts.Length -eq 3 -and $parts[0] -eq 'MJ3') {
+            $seq32 = 0
+            if ([int]::TryParse($parts[1], [ref]$seq32)) {
+                [void]$list.Add((New-Object psobject -Property @{ Seq = $seq32; Ref = $parts[2] }))
+            }
+        }
+        return $list.ToArray()
+    }
+    for ($i = 1; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i].Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $sp = $line.IndexOf(' ')
+        if ($sp -lt 1) { continue }
+        $seq32 = 0
+        if (-not [int]::TryParse($line.Substring(0, $sp), [ref]$seq32)) { continue }
+        $ref = $line.Substring($sp + 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($ref)) { continue }
+        [void]$list.Add((New-Object psobject -Property @{ Seq = $seq32; Ref = $ref }))
+    }
+    return $list.ToArray()
+}
+
+function Format-Manifest($Entries) {
+    if ($Entries -eq $null) { return '' }
+    $arr = @($Entries | Sort-Object Seq)
+    if ($arr.Count -eq 0) { return '' }
+    if ($arr.Count -gt 8) { $arr = $arr[($arr.Count - 8)..($arr.Count - 1)] }
+    while ($arr.Count -gt 0) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        [void]$lines.Add('MJ3')
+        foreach ($e in $arr) { [void]$lines.Add(([string]$e.Seq + ' ' + $e.Ref)) }
+        $text = [string]::Join("`n", $lines.ToArray())
+        if ($text.Length -le 512) { return $text }
+        if ($arr.Count -eq 1) { throw 'manifest entry does not fit in 512 characters' }
+        $arr = $arr[1..($arr.Count - 1)]
+    }
+    return ''
+}
+
+function New-PayloadRef([int]$Seq, [string]$Text) {
+    $blob = Protect-MJText $Seq $Text
+    if ($blob.Length -le 180) { return ('i:' + $blob) }
+    return (Publish-Telegraph $blob)
+}
+
+function Read-PayloadRef([string]$Ref) {
+    $blob = $null
+    if ($Ref.StartsWith('i:')) {
+        $blob = $Ref.Substring(2)
+    } elseif ($Ref.StartsWith('http://') -or $Ref.StartsWith('https://')) {
+        $blob = Invoke-WebUtf8 -Url $Ref -Method 'GET' -TimeoutMs 60000
+    } else {
+        $blob = Read-Telegraph $Ref
+    }
+    return (Unprotect-MJText $blob)
+}
+
+function Send-Outbound([string]$Text) {
+    try {
+        $seq = $script:LastOutSeq + 1
+        $ref = New-PayloadRef $seq $Text
+        $current = @(Parse-Manifest (Get-MJDescription $script:OutLang))
+        $kept = New-Object System.Collections.Generic.List[object]
+        foreach ($e in $current) {
+            if ($e.Seq -lt $seq) { [void]$kept.Add($e) }
+        }
+        [void]$kept.Add((New-Object psobject -Property @{ Seq = $seq; Ref = $ref }))
+        Set-MJDescription $script:OutLang (Format-Manifest $kept)
+        $script:LastOutSeq = $seq
+        Save-LocalConfig
+    } catch {
+        Write-Live ("Yanit gonderilemedi: " + (Hide-Secret $_.Exception.Message)) 'Yellow'
+    }
+}
+
+function Get-InboundNew {
+    $desc = Get-MJDescription $script:InLang
+    $entries = @(Parse-Manifest $desc)
+    $entries = @($entries | Sort-Object Seq)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $entries) {
+        if ($e.Seq -le $script:LastInSeq) { continue }
+        try {
+            $got = Read-PayloadRef $e.Ref
+            if ([int]$got.Seq -ne [int]$e.Seq) { throw ('seq mismatch pointer=' + $e.Seq + ' blob=' + $got.Seq) }
+            [void]$out.Add((New-Object psobject -Property @{ Seq = [int]$e.Seq; Text = [string]$got.Text }))
+        } catch {
+            Write-Live ("Gelen paket okunamadi (seq " + $e.Seq + "): " + (Hide-Secret $_.Exception.Message)) 'Yellow'
+        }
+    }
+    return $out.ToArray()
 }
 
 function Invoke-Claude([string]$Prompt) {
@@ -295,7 +625,6 @@ function Invoke-Claude([string]$Prompt) {
         [void]$p.Start()
         $tOut = $p.StandardOutput.ReadToEndAsync()
         $tErr = $p.StandardError.ReadToEndAsync()
-        # PS 5.1 / .NET Framework has no StandardInputEncoding; write UTF-8 bytes.
         $promptBytes = [System.Text.Encoding]::UTF8.GetBytes($Prompt)
         $p.StandardInput.BaseStream.Write($promptBytes, 0, $promptBytes.Length)
         $p.StandardInput.BaseStream.Flush()
@@ -358,7 +687,7 @@ function Show-Banner {
     Write-Host ('  Klasor : ' + $script:WorkDir)
     Write-Host ('  Claude : ' + $script:ClaudeExe)
     Write-Host ('  Izin   : ' + $script:PermissionMode)
-    Write-Host '  Transport: ntfy.sh (anlik HTTP)'
+    Write-Host '  Transport: Telegram Bot API (anlik, getUpdates yok)'
     Write-Host '  Izinler: acceptEdits = dosya duzenlemeleri otomatik.'
     Write-Host '           Bash vs. hala onay isteyebilir; takilirsa'
     Write-Host '           config''te PermissionMode = bypassPermissions yapin.'
@@ -395,58 +724,79 @@ function Handle-Message([string]$Prompt) {
     Write-Host 'Dinleniyor...' -ForegroundColor Green
 }
 
-function Process-NtfyLine([string]$Line, [ref]$SinceId) {
-    if ([string]::IsNullOrWhiteSpace($Line)) { return }
-    $ev = $null
-    try { $ev = $Line | ConvertFrom-Json } catch { return }
-    if ($ev.id) { $SinceId.Value = [string]$ev.id }
-    if ($ev.event -ne 'message') { return }
-
-    $body = [string]$ev.message
-    if ($ev.attachment -and $ev.attachment.url) {
-        try {
-            $body = Get-UrlText ([string]$ev.attachment.url)
-        } catch {
-            Write-Live ('Ek indirilemedi: ' + $_.Exception.Message) 'Yellow'
-        }
-    }
-    $prompt = Get-InboundPrompt $body
-    if ($prompt -eq $null) { return }
-    Handle-Message $prompt
-}
-
-function Start-NtfyLoop {
-    $since = [string](Get-UnixNow)
-    Write-Live 'Sadece bundan sonra gelen mesajlar islenecek.' 'DarkGray'
+function Start-ListenLoop {
+    Write-Live 'Sadece bundan sonra gelen mesajlar islenecek (oncekiler atlanir, sonraki calistirmada kuyruk alinir).' 'DarkGray'
     while ($true) {
-        $url = $script:NtfyBase + '/' + $script:InTopic + '/json?since=' + $since
-        $req = $null
-        $resp = $null
-        $reader = $null
         try {
-            $req = [System.Net.HttpWebRequest]::Create($url)
-            $req.Method = 'GET'
-            $req.UserAgent = 'megajam-bridge/1.0'
-            $req.Timeout = 30000
-            $req.ReadWriteTimeout = 180000
-            $req.KeepAlive = $true
-            try {
-                $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
-            } catch {}
-            $resp = $req.GetResponse()
-            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
-            while ($true) {
-                $line = $reader.ReadLine()
-                if ($line -eq $null) { break }
-                Process-NtfyLine $line ([ref]$since)
+            $new = @(Get-InboundNew)
+            foreach ($m in $new) {
+                $script:LastInSeq = [int]$m.Seq
+                Save-LocalConfig
+                Handle-Message ([string]$m.Text)
             }
         } catch {
-            Write-Live ('Baglanti koptu, 3 sn sonra yeniden: ' + $_.Exception.Message) 'DarkGray'
-        } finally {
-            if ($reader -ne $null) { try { $reader.Close() } catch {} }
-            if ($resp -ne $null) { try { $resp.Close() } catch {} }
+            Write-Live ('Baglanti koptu, 3 sn sonra yeniden: ' + (Hide-Secret $_.Exception.Message)) 'DarkGray'
+            Start-Sleep -Seconds 3
+            continue
         }
-        Start-Sleep -Seconds 3
+        Start-Sleep -Milliseconds ([Math]::Max(400, [int]($script:PollSec * 1000)))
+    }
+}
+
+function Save-LocalScriptCopy {
+    $dir = Get-ConfigDir
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $dest = Join-Path $dir 'bridge.ps1'
+    $utf8bom = New-Object System.Text.UTF8Encoding $true
+    $saved = $false
+    $from = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($script:StartupCommandPath) -and (Test-Path -LiteralPath $script:StartupCommandPath)) {
+        if ($script:StartupCommandPath -ne $dest) {
+            try {
+                Copy-Item -LiteralPath $script:StartupCommandPath -Destination $dest -Force
+                $saved = $true
+                $from = 'dosya kopyasi'
+            } catch {}
+        } else {
+            $saved = $true
+            $from = 'zaten yerel dosya'
+        }
+    }
+
+    if (-not $saved -and -not [string]::IsNullOrWhiteSpace($script:StartupScriptBlock) -and $script:StartupScriptBlock.Length -gt 500) {
+        try {
+            [System.IO.File]::WriteAllText($dest, $script:StartupScriptBlock, $utf8bom)
+            $saved = $true
+            $from = 'script blogu'
+        } catch {}
+    }
+
+    if (-not $saved -and -not [string]::IsNullOrWhiteSpace($script:StartupDefinition) -and $script:StartupDefinition.Length -gt 500) {
+        try {
+            [System.IO.File]::WriteAllText($dest, $script:StartupDefinition, $utf8bom)
+            $saved = $true
+            $from = 'komut tanimi'
+        } catch {}
+    }
+
+    if (-not $saved) {
+        try {
+            $raw = Invoke-WebUtf8 -Url $script:RawScriptUrl -Method 'GET' -TimeoutMs 30000
+            if (-not [string]::IsNullOrWhiteSpace($raw) -and $raw.Length -gt 500) {
+                [System.IO.File]::WriteAllText($dest, $raw, $utf8bom)
+                $saved = $true
+                $from = 'GitHub'
+            }
+        } catch {}
+    }
+
+    if ($saved) {
+        Write-Live ("Yerel kopya kaydedildi (" + $from + "): " + $dest) 'DarkGray'
+    } else {
+        Write-Live ("Yerel kopya kaydedilemedi. Sonra soyle calistirin: irm " + $script:RawScriptUrl + " | iex") 'Yellow'
     }
 }
 
@@ -454,26 +804,29 @@ function Start-NtfyLoop {
 Initialize-Tls
 Initialize-Utf8Console
 Resolve-Config
+Get-MJKeys
 Ensure-WorkDir
 Save-LocalConfig
+Save-LocalScriptCopy
 
-# Keep a local copy so later runs do not need the network.
-try {
-    $destScript = Join-Path $env:USERPROFILE (Join-Path '.megajam-bridge' 'bridge.ps1')
-    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
-        if ($PSCommandPath -ne $destScript) {
-            Copy-Item -LiteralPath $PSCommandPath -Destination $destScript -Force
-        }
-    } else {
-        $def = $MyInvocation.MyCommand.Definition
-        if (-not [string]::IsNullOrWhiteSpace($def) -and $def.Length -gt 500) {
-            $utf8bom = New-Object System.Text.UTF8Encoding $true
-            [System.IO.File]::WriteAllText($destScript, $def, $utf8bom)
-        }
+# First run (no LastInSeq in a pre-existing config): skip whatever is already in the inbox.
+# Subsequent runs keep LastInSeq and catch up anything queued while the window was closed.
+$hadPrior = $false
+$cfgPrior = Read-LocalConfig
+if ($cfgPrior -ne $null -and $cfgPrior.LastInSeq -and ([int]$cfgPrior.LastInSeq -gt 0)) { $hadPrior = $true }
+if (-not $hadPrior) {
+    try {
+        $existing = @(Parse-Manifest (Get-MJDescription $script:InLang))
+        $max = 0
+        foreach ($e in $existing) { if ($e.Seq -gt $max) { $max = [int]$e.Seq } }
+        $script:LastInSeq = $max
+        Save-LocalConfig
+    } catch {
+        Write-Live ('Mevcut gelen kutusu okunamadi: ' + (Hide-Secret $_.Exception.Message)) 'Yellow'
     }
-} catch {}
+}
 
 Show-Banner
-$boot = "Kopru hazir.`nKlasor: $($script:WorkDir)`nClaude: $($script:ClaudeExe)`nIzin: $($script:PermissionMode)`nSaat: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$boot = "Kopru hazir.`nKlasor: $($script:WorkDir)`nClaude: $($script:ClaudeExe)`nIzin: $($script:PermissionMode)`nTransport: Telegram`nSaat: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Send-Outbound $boot
-Start-NtfyLoop
+Start-ListenLoop

@@ -1,5 +1,11 @@
 config.env
 config.json
 .read_since
+.in_seq
+.out_seq
+.out_pub_seq
+.telegraph_token
 .megajam-bridge/
 *.local
+run_line.txt
+ONE_LINER.txt
