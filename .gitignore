@@ -1,0 +1,5 @@
+config.env
+config.json
+.read_since
+.megajam-bridge/
+*.local
