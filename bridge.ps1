@@ -704,7 +704,7 @@ function New-MJClaudeArgs([bool]$ContinueSession) {
     [void]$argList.Add('text')
     [void]$argList.Add('--permission-mode')
     [void]$argList.Add($script:PermissionMode)
-    return $argList
+    return ,$argList
 }
 
 function New-MJCursorArgs([bool]$ContinueSession) {
@@ -732,7 +732,7 @@ function New-MJCursorArgs([bool]$ContinueSession) {
         [void]$argList.Add('--model')
         [void]$argList.Add($script:AgentModel)
     }
-    return $argList
+    return ,$argList
 }
 
 function Invoke-MJCli([string]$Prompt) {
@@ -757,10 +757,10 @@ function Invoke-MJCli([string]$Prompt) {
         try { $ext = [System.IO.Path]::GetExtension($exe) } catch {}
         if ($ext -match '(?i)^\.(cmd|bat)$') {
             $psi.FileName = $env:ComSpec
-            $psi.Arguments = '/d /c "' + $exe + '" ' + [string]::Join(' ', $argList.ToArray())
+            $psi.Arguments = '/d /c "' + $exe + '" ' + (@($argList) -join ' ')
         } else {
             $psi.FileName = $exe
-            $psi.Arguments = [string]::Join(' ', $argList.ToArray())
+            $psi.Arguments = (@($argList) -join ' ')
         }
         $psi.WorkingDirectory = $script:WorkDir
         $psi.UseShellExecute = $false
