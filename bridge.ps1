@@ -1,11 +1,13 @@
-# MegaJam Claude bridge for Windows PowerShell 5.1+
+# MegaJam agent bridge for Windows PowerShell 5.1+
 # Secret-free in the repo: pass the bot token and shared secret via $MJ_TOKEN
 # and $MJ_SECRET (or a local config file). Transport is the Telegram Bot API
 # (language-specific description slots) plus encrypted inline/Telegraph blobs.
 # This script never calls getUpdates, so it does not conflict with other
 # consumers of the same bot token.
+# Default engine is Cursor CLI (cursor-agent). Set $MJ_ENGINE='claude' to use
+# Claude Code instead.
 # Usage (first run):
-#   $MJ_TOKEN='...'; $MJ_SECRET='...'; $MJ_PERMISSION='bypassPermissions'; irm <raw-url> | iex
+#   $MJ_ENGINE='cursor'; $MJ_TOKEN='...'; $MJ_SECRET='...'; $MJ_PERMISSION='bypassPermissions'; irm <raw-url> | iex
 # Later runs (config already saved):
 #   irm <raw-url> | iex
 # Or run the saved copy:
@@ -102,7 +104,10 @@ function Save-LocalConfig {
         Token          = $script:Token
         Secret         = $script:Secret
         WorkDir        = $script:WorkDir
+        Engine         = $script:Engine
         ClaudeExe      = $script:ClaudeExe
+        CursorExe      = $script:CursorExe
+        Model          = $script:AgentModel
         PermissionMode = $script:PermissionMode
         TimeoutSec     = $script:TimeoutSec
         InLang         = $script:InLang
@@ -135,6 +140,78 @@ function Resolve-ClaudeExe([string]$Override) {
     return $candidates[0]
 }
 
+function Test-MJCursorPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    # Prefer the official Cursor CLI binary. Bare "agent" can be another product
+    # (for example a Grok agent host), so only accept "agent*" under cursor-agent.
+    $leaf = [System.IO.Path]::GetFileName($Path)
+    if ($leaf -match '(?i)^cursor-agent(\.(exe|cmd|bat|ps1))?$') { return $true }
+    $norm = $Path.Replace('/', '\').ToLower()
+    if ($norm -like '*\cursor-agent\agent*') { return $true }
+    return $false
+}
+
+function Add-MJCandidate {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    foreach ($existing in $List) {
+        if ([string]::Equals($existing, $Path, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    [void]$List.Add($Path)
+}
+
+function Resolve-CursorExe([string]$Override) {
+    if (-not [string]::IsNullOrWhiteSpace($Override) -and (Test-Path -LiteralPath $Override)) {
+        return $Override
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $local = $env:LOCALAPPDATA
+    if (-not [string]::IsNullOrWhiteSpace($local)) {
+        $root = Join-Path $local 'cursor-agent'
+        Add-MJCandidate $candidates (Join-Path $root 'cursor-agent.exe')
+        Add-MJCandidate $candidates (Join-Path $root 'cursor-agent.cmd')
+    }
+    $homeBin = Join-Path $env:USERPROFILE (Join-Path '.local' 'bin')
+    Add-MJCandidate $candidates (Join-Path $homeBin 'cursor-agent.exe')
+    Add-MJCandidate $candidates (Join-Path $homeBin 'cursor-agent.cmd')
+    Add-MJCandidate $candidates (Join-Path $homeBin 'cursor-agent')
+
+    foreach ($name in @('cursor-agent.exe', 'cursor-agent.cmd', 'cursor-agent')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd -ne $null -and -not [string]::IsNullOrWhiteSpace($cmd.Source) -and (Test-MJCursorPath $cmd.Source)) {
+            Add-MJCandidate $candidates $cmd.Source
+        }
+    }
+
+    # Official docs also expose an "agent" alias; only use it if it is Cursor's.
+    foreach ($name in @('agent.exe', 'agent.cmd', 'agent')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd -ne $null -and -not [string]::IsNullOrWhiteSpace($cmd.Source) -and (Test-MJCursorPath $cmd.Source)) {
+            Add-MJCandidate $candidates $cmd.Source
+        }
+    }
+
+    foreach ($c in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path -LiteralPath $c)) { return $c }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Override)) { return $Override }
+    if (-not [string]::IsNullOrWhiteSpace($local)) {
+        return (Join-Path (Join-Path $local 'cursor-agent') 'cursor-agent.exe')
+    }
+    return (Join-Path $homeBin 'cursor-agent.exe')
+}
+
+function Test-MJAutoApprove {
+    $pm = $script:PermissionMode
+    if ([string]::IsNullOrWhiteSpace($pm)) { return $false }
+    $n = $pm.Trim().ToLower()
+    return ($n -eq 'bypasspermissions' -or $n -eq 'unrestricted' -or $n -eq 'force' -or $n -eq 'yolo')
+}
+
 function Resolve-Config {
     $cfg = Read-LocalConfig
 
@@ -144,6 +221,9 @@ function Resolve-Config {
     $sec = Get-MJVar 'MJ_SECRET'
     $wd  = Get-MJVar 'MJ_WORKDIR'
     $ce  = Get-MJVar 'MJ_CLAUDE'
+    $cu  = Get-MJVar 'MJ_CURSOR'
+    $eng = Get-MJVar 'MJ_ENGINE'
+    $md  = Get-MJVar 'MJ_MODEL'
     $pm  = Get-MJVar 'MJ_PERMISSION'
     $to  = Get-MJVar 'MJ_TIMEOUT'
     $il  = Get-MJVar 'MJ_IN_LANG'
@@ -155,12 +235,18 @@ function Resolve-Config {
     if ([string]::IsNullOrWhiteSpace($sec) -and $env:MEGAJAM_SECRET) { $sec = $env:MEGAJAM_SECRET }
     if ([string]::IsNullOrWhiteSpace($wd)  -and $env:MEGAJAM_WORKDIR) { $wd = $env:MEGAJAM_WORKDIR }
     if ([string]::IsNullOrWhiteSpace($ce)  -and $env:MEGAJAM_CLAUDE) { $ce = $env:MEGAJAM_CLAUDE }
+    if ([string]::IsNullOrWhiteSpace($cu)  -and $env:MEGAJAM_CURSOR) { $cu = $env:MEGAJAM_CURSOR }
+    if ([string]::IsNullOrWhiteSpace($eng) -and $env:MEGAJAM_ENGINE) { $eng = $env:MEGAJAM_ENGINE }
+    if ([string]::IsNullOrWhiteSpace($md)  -and $env:MEGAJAM_MODEL) { $md = $env:MEGAJAM_MODEL }
     if ([string]::IsNullOrWhiteSpace($pm)  -and $env:MEGAJAM_PERMISSION) { $pm = $env:MEGAJAM_PERMISSION }
 
     if ([string]::IsNullOrWhiteSpace($tok) -and $cfg -ne $null -and $cfg.Token) { $tok = [string]$cfg.Token }
     if ([string]::IsNullOrWhiteSpace($sec) -and $cfg -ne $null -and $cfg.Secret) { $sec = [string]$cfg.Secret }
     if ([string]::IsNullOrWhiteSpace($wd)  -and $cfg -ne $null -and $cfg.WorkDir) { $wd = [string]$cfg.WorkDir }
     if ([string]::IsNullOrWhiteSpace($ce)  -and $cfg -ne $null -and $cfg.ClaudeExe) { $ce = [string]$cfg.ClaudeExe }
+    if ([string]::IsNullOrWhiteSpace($cu)  -and $cfg -ne $null -and $cfg.CursorExe) { $cu = [string]$cfg.CursorExe }
+    if ([string]::IsNullOrWhiteSpace($eng) -and $cfg -ne $null -and $cfg.Engine) { $eng = [string]$cfg.Engine }
+    if ([string]::IsNullOrWhiteSpace($md)  -and $cfg -ne $null -and $cfg.Model) { $md = [string]$cfg.Model }
     if ([string]::IsNullOrWhiteSpace($pm)  -and $cfg -ne $null -and $cfg.PermissionMode) { $pm = [string]$cfg.PermissionMode }
     if ([string]::IsNullOrWhiteSpace($to)  -and $cfg -ne $null -and $cfg.TimeoutSec) { $to = [string]$cfg.TimeoutSec }
     if ([string]::IsNullOrWhiteSpace($il)  -and $cfg -ne $null -and $cfg.InLang) { $il = [string]$cfg.InLang }
@@ -176,9 +262,9 @@ function Resolve-Config {
 
     if ([string]::IsNullOrWhiteSpace($tok) -or [string]::IsNullOrWhiteSpace($sec)) {
         Write-Host ''
-        Write-Host 'MegaJam Claude koprusu: bot token veya gizli anahtar eksik.' -ForegroundColor Red
+        Write-Host 'MegaJam koprusu: bot token veya gizli anahtar eksik.' -ForegroundColor Red
         Write-Host 'Ilk calistirmada PowerShell''e sunlari yazin (tek satir):' -ForegroundColor Yellow
-        Write-Host '  $MJ_TOKEN=''BOT_TOKEN''; $MJ_SECRET=''SECRET''; irm <raw-url> | iex'
+        Write-Host '  $MJ_ENGINE=''cursor''; $MJ_TOKEN=''BOT_TOKEN''; $MJ_SECRET=''SECRET''; irm <raw-url> | iex'
         Write-Host 'Ayarlar sonra su dosyaya kaydedilir:'
         Write-Host ('  ' + (Get-ConfigPath))
         exit 1
@@ -193,7 +279,18 @@ function Resolve-Config {
     $script:OutLang        = $ol.Trim()
     $script:PollSec        = [double]$po
     if ($script:PollSec -lt 0.4) { $script:PollSec = 0.4 }
+
+    if ([string]::IsNullOrWhiteSpace($eng)) { $eng = 'cursor' }
+    $eng = $eng.Trim().ToLower()
+    if ($eng -eq 'cursor-agent' -or $eng -eq 'cursorcli' -or $eng -eq 'cursor-cli') { $eng = 'cursor' }
+    if ($eng -ne 'cursor' -and $eng -ne 'claude') {
+        Write-Live ("Bilinmeyen MJ_ENGINE='" + $eng + "', cursor kullanilacak.") 'Yellow'
+        $eng = 'cursor'
+    }
+    $script:Engine = $eng
+    if ([string]::IsNullOrWhiteSpace($md)) { $script:AgentModel = '' } else { $script:AgentModel = $md.Trim() }
     $script:ClaudeExe      = Resolve-ClaudeExe $ce
+    $script:CursorExe      = Resolve-CursorExe $cu
     $script:UseContinue    = $true
     $script:LastInSeq      = 0
     $script:LastOutSeq     = 0
@@ -589,26 +686,82 @@ function Get-InboundNew {
     return $out.ToArray()
 }
 
-function Invoke-Claude([string]$Prompt) {
-    if (-not (Test-Path -LiteralPath $script:ClaudeExe)) {
-        return ('HATA: claude.exe bulunamadi: ' + $script:ClaudeExe)
+function Get-MJEngineLabel {
+    if ($script:Engine -eq 'cursor') { return 'Cursor' }
+    return 'Claude'
+}
+
+function Get-MJEngineExe {
+    if ($script:Engine -eq 'cursor') { return $script:CursorExe }
+    return $script:ClaudeExe
+}
+
+function New-MJClaudeArgs([bool]$ContinueSession) {
+    $argList = New-Object System.Collections.Generic.List[string]
+    [void]$argList.Add('--print')
+    if ($ContinueSession) { [void]$argList.Add('--continue') }
+    [void]$argList.Add('--output-format')
+    [void]$argList.Add('text')
+    [void]$argList.Add('--permission-mode')
+    [void]$argList.Add($script:PermissionMode)
+    return $argList
+}
+
+function New-MJCursorArgs([bool]$ContinueSession) {
+    # Official Cursor CLI equivalents of claude --print --continue:
+    #   --print / -p, --continue (alias of --resume=-1), --output-format text
+    # Auto-approve: --force (alias --yolo) plus --trust so headless mode
+    # does not stop on the workspace trust dialog. --approve-mcps and
+    # --sandbox disabled avoid hangs on MCP prompts or a command sandbox
+    # when PermissionMode is bypassPermissions.
+    $argList = New-Object System.Collections.Generic.List[string]
+    [void]$argList.Add('--print')
+    if ($ContinueSession) { [void]$argList.Add('--continue') }
+    [void]$argList.Add('--output-format')
+    [void]$argList.Add('text')
+    if (Test-MJAutoApprove) {
+        [void]$argList.Add('--force')
+        [void]$argList.Add('--trust')
+        [void]$argList.Add('--approve-mcps')
+        [void]$argList.Add('--sandbox')
+        [void]$argList.Add('disabled')
+    } else {
+        [void]$argList.Add('--trust')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:AgentModel)) {
+        [void]$argList.Add('--model')
+        [void]$argList.Add($script:AgentModel)
+    }
+    return $argList
+}
+
+function Invoke-MJCli([string]$Prompt) {
+    $label = Get-MJEngineLabel
+    $exe = Get-MJEngineExe
+    if ([string]::IsNullOrWhiteSpace($exe) -or -not (Test-Path -LiteralPath $exe)) {
+        return ('HATA: ' + $label + ' bulunamadi: ' + $exe)
     }
 
     $attemptContinue = $script:UseContinue
     $try = 0
     while ($try -lt 2) {
         $try = $try + 1
-        $argList = New-Object System.Collections.Generic.List[string]
-        [void]$argList.Add('--print')
-        if ($attemptContinue) { [void]$argList.Add('--continue') }
-        [void]$argList.Add('--output-format')
-        [void]$argList.Add('text')
-        [void]$argList.Add('--permission-mode')
-        [void]$argList.Add($script:PermissionMode)
+        if ($script:Engine -eq 'cursor') {
+            $argList = New-MJCursorArgs $attemptContinue
+        } else {
+            $argList = New-MJClaudeArgs $attemptContinue
+        }
 
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $script:ClaudeExe
-        $psi.Arguments = [string]::Join(' ', $argList.ToArray())
+        $ext = ''
+        try { $ext = [System.IO.Path]::GetExtension($exe) } catch {}
+        if ($ext -match '(?i)^\.(cmd|bat)$') {
+            $psi.FileName = $env:ComSpec
+            $psi.Arguments = '/d /c "' + $exe + '" ' + [string]::Join(' ', $argList.ToArray())
+        } else {
+            $psi.FileName = $exe
+            $psi.Arguments = [string]::Join(' ', $argList.ToArray())
+        }
         $psi.WorkingDirectory = $script:WorkDir
         $psi.UseShellExecute = $false
         $psi.RedirectStandardInput = $true
@@ -636,7 +789,7 @@ function Invoke-Claude([string]$Prompt) {
             try {
                 Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
             } catch {}
-            return ('HATA: Claude ' + $script:TimeoutSec + ' saniye icinde bitmedi, islem durduruldu.')
+            return ('HATA: ' + $label + ' ' + $script:TimeoutSec + ' saniye icinde bitmedi, islem durduruldu.')
         }
         try { [void]$tOut.Wait(15000) } catch {}
         try { [void]$tErr.Wait(15000) } catch {}
@@ -649,7 +802,7 @@ function Invoke-Claude([string]$Prompt) {
         $looksLikeNoSession = $false
         if ($attemptContinue -and $code -ne 0) {
             $combined = ($stdout + ' ' + $stderr)
-            if ($combined -match '(?i)no (conversation|session)|nothing to (continue|resume)|cannot continue') {
+            if ($combined -match '(?i)no (conversation|session|chat)|nothing to (continue|resume)|cannot continue|unable to (continue|resume)|chat not found|unknown chat') {
                 $looksLikeNoSession = $true
             }
         }
@@ -667,7 +820,7 @@ function Invoke-Claude([string]$Prompt) {
             if (-not [string]::IsNullOrWhiteSpace($stderr)) {
                 $out = $stderr.Trim()
             } else {
-                $out = ('(Claude bos yanit verdi, cikis kodu ' + $code + ')')
+                $out = ('(' + $label + ' bos yanit verdi, cikis kodu ' + $code + ')')
             }
         } elseif (-not [string]::IsNullOrWhiteSpace($stderr) -and $code -ne 0) {
             $errTrim = $stderr.Trim()
@@ -676,23 +829,39 @@ function Invoke-Claude([string]$Prompt) {
         }
         return $out
     }
-    return 'HATA: Claude calistirilamadi.'
+    return ('HATA: ' + $label + ' calistirilamadi.')
 }
 
 function Show-Banner {
+    $label = Get-MJEngineLabel
+    $exe = Get-MJEngineExe
     Write-Host ''
     Write-Host '========================================' -ForegroundColor Cyan
-    Write-Host '  MegaJam Claude koprusu' -ForegroundColor Cyan
+    Write-Host ('  MegaJam ' + $label + ' koprusu') -ForegroundColor Cyan
     Write-Host '========================================' -ForegroundColor Cyan
+    Write-Host ('  Motor  : ' + $script:Engine)
     Write-Host ('  Klasor : ' + $script:WorkDir)
-    Write-Host ('  Claude : ' + $script:ClaudeExe)
+    Write-Host ('  Yazilim: ' + $exe)
+    if ($script:Engine -eq 'cursor' -and -not [string]::IsNullOrWhiteSpace($script:AgentModel)) {
+        Write-Host ('  Model  : ' + $script:AgentModel)
+    }
     Write-Host ('  Izin   : ' + $script:PermissionMode)
     Write-Host '  Transport: Telegram Bot API (anlik, getUpdates yok)'
-    Write-Host '  Izinler: acceptEdits = dosya duzenlemeleri otomatik.'
-    Write-Host '           Bash vs. hala onay isteyebilir; takilirsa'
-    Write-Host '           config''te PermissionMode = bypassPermissions yapin.'
-    if (-not (Test-Path -LiteralPath $script:ClaudeExe)) {
-        Write-Host '  UYARI: claude.exe bulunamadi. Yolu kontrol edin.' -ForegroundColor Yellow
+    if ($script:Engine -eq 'cursor') {
+        Write-Host '  Cursor: --print --continue --output-format text'
+        if (Test-MJAutoApprove) {
+            Write-Host '          --force --trust --approve-mcps --sandbox disabled'
+        } else {
+            Write-Host '          --trust (dosya yazabilir; kabuk icin --force yok).'
+            Write-Host '          Takilirsa $MJ_PERMISSION=''bypassPermissions'' yazin.'
+        }
+    } else {
+        Write-Host '  Izinler: acceptEdits = dosya duzenlemeleri otomatik.'
+        Write-Host '           Bash vs. hala onay isteyebilir; takilirsa'
+        Write-Host '           config''te PermissionMode = bypassPermissions yapin.'
+    }
+    if (-not (Test-Path -LiteralPath $exe)) {
+        Write-Host ('  UYARI: ' + $label + ' bulunamadi. Yolu kontrol edin.') -ForegroundColor Yellow
     }
     Write-Host '========================================' -ForegroundColor Cyan
     Write-Host 'Dinleniyor...  Ctrl+C ile cikis' -ForegroundColor Green
@@ -714,10 +883,11 @@ function Handle-Message([string]$Prompt) {
         return
     }
 
-    Write-Host 'Claude calisiyor...' -ForegroundColor DarkGray
-    $reply = Invoke-Claude $Prompt
+    $label = Get-MJEngineLabel
+    Write-Host ($label + ' calisiyor...') -ForegroundColor DarkGray
+    $reply = Invoke-MJCli $Prompt
     Write-Host ''
-    Write-Host ('----- CLAUDE [' + (Get-Date -Format 'HH:mm:ss') + '] -----') -ForegroundColor Cyan
+    Write-Host ('----- ' + $label.ToUpper() + ' [' + (Get-Date -Format 'HH:mm:ss') + '] -----') -ForegroundColor Cyan
     Write-Host $reply
     Write-Host ''
     Send-Outbound $reply
@@ -827,6 +997,6 @@ if (-not $hadPrior) {
 }
 
 Show-Banner
-$boot = "Kopru hazir.`nKlasor: $($script:WorkDir)`nClaude: $($script:ClaudeExe)`nIzin: $($script:PermissionMode)`nTransport: Telegram`nSaat: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$boot = "Kopru hazir.`nMotor: $($script:Engine)`nKlasor: $($script:WorkDir)`nYazilim: $(Get-MJEngineExe)`nIzin: $($script:PermissionMode)`nTransport: Telegram`nSaat: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Send-Outbound $boot
 Start-ListenLoop
