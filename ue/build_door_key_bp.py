@@ -95,14 +95,14 @@ class G(object):
                 if not ip.set_pin_value(str(v)):
                     FAIL.append('set %s=%s failed on %s' % (name, v, node.get_node_title()))
 
-    def fn(self, path, **pins):
-        node = self.ed.add_call_function_node(path)
+    def fn(_g, path, **pins):
+        node = _g.ed.add_call_function_node(path)
         if node is None:
             FAIL.append('missing function ' + path)
             raise RuntimeError('missing function ' + path)
-        self._pos(node, 0)
-        self.y += 40
-        self.feed(node, pins)
+        _g._pos(node, 0)
+        _g.y += 40
+        _g.feed(node, pins)
         return node
 
     def get(self, var, cls='', target=None):
@@ -115,8 +115,8 @@ class G(object):
             self.feed(node, {'self': target})
         return node
 
-    def setv(self, var, value):
-        node = self.ed.add_set_member_variable_node(var, '')
+    def setv(self, var, value, cls='', target=None):
+        node = self.ed.add_set_member_variable_node(var, cls)
         if node is None:
             raise RuntimeError('no setter for ' + var)
         self._pos(node)
@@ -134,6 +134,8 @@ class G(object):
                 self.connect(src, ip, 'set ' + var)
             else:
                 ip.set_pin_value(str(value))
+        if target is not None:
+            self.feed(node, {'self': target})
         return node
 
     def branch(self, cond):
@@ -211,7 +213,7 @@ def hook_event(bp, g, event_name, pos):
             keep.append(lp)
     if not keep:
         return then
-    seq = g.by_menu(['Utilities|Flow Control|Sequence', 'Utilities|FlowControl|Sequence'], ['Sequence'])
+    seq = g.by_menu(['Utilities|FlowControl|Sequence'], ['FlowControl', 'Sequence'])
     then.break_pin_links()
     g.connect(then, seq.find_execute_pin(), 'seq in')
     for lp in keep:
@@ -278,14 +280,47 @@ def print_msg(g, text, r, gr, b):
                 TextColor='(R=%s,G=%s,B=%s,A=1.000000)' % (r, gr, b))
 
 
+def pkg_dirty(path):
+    names = [x.get_name() for x in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]
+    return path in names
+
+
+def link_proxies():
+    """Editor data only: point each door/key at its Proxy_<label> mesh actor and make that mesh
+    Movable so it can swing at runtime. Nothing is moved."""
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    acts = eas.get_all_level_actors()
+    by_label = dict((a.get_actor_label(), a) for a in acts)
+    n = 0
+    miss = []
+    for a in acts:
+        cn = a.get_class().get_name()
+        if not (cn.startswith('BP_Door') or cn.startswith('BP_Key')):
+            continue
+        prox = by_label.get('Proxy_' + a.get_actor_label())
+        if prox is None:
+            miss.append(a.get_actor_label())
+            continue
+        a.set_editor_property('MJ_Proxy', prox)
+        rc = prox.get_editor_property('root_component')
+        if rc and cn.startswith('BP_Door'):
+            rc.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
+        n += 1
+    say('linked proxies', n, 'missing', miss)
+    return n
+
+
 def backup(path):
-    stamp = time.strftime('%Y%m%d_%H%M%S')
-    dst = '%s_MJBackup_%s' % (path, stamp)
-    ok = unreal.EditorAssetLibrary.duplicate_asset(path, dst)
-    if ok:
-        unreal.EditorAssetLibrary.save_asset(dst, only_if_is_dirty=False)
-    say('backup', dst, bool(ok))
-    return bool(ok)
+    """Copy the on-disk .uasset (pristine, saved version) to <Project>/Saved/MJBackups/<time>/."""
+    import os, shutil
+    rel = path.replace('/Game/', '', 1) + '.uasset'
+    src = os.path.join(unreal.Paths.project_content_dir(), rel)
+    dst_dir = os.path.join(unreal.Paths.project_saved_dir(), 'MJBackups', time.strftime('%Y%m%d_%H%M%S'))
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, os.path.basename(rel))
+    shutil.copy2(src, dst)
+    say('backup', os.path.abspath(dst))
+    return os.path.isfile(dst)
 
 
 def finish(bp, path):
@@ -295,7 +330,9 @@ def finish(bp, path):
         for n in BGE.get_graph_editor(gr).list_nodes_with_errors():
             errs.append('%s: %s' % (n.get_node_title(), n.get_editor_property('error_msg')))
     say('compile', path, ok, 'errors:', errs[:10])
-    if ok and not errs and not DRY_RUN:
+    if FAIL:
+        say('wiring problems:', FAIL[:25])
+    if ok and not errs and not FAIL and not DRY_RUN:
         unreal.EditorAssetLibrary.save_loaded_asset(bp, only_if_is_dirty=False)
         say('SAVED', path)
         return True
@@ -305,138 +342,237 @@ def finish(bp, path):
     return False
 
 
-def build_door():
-    say('\n== BP_Door')
-    bp = unreal.EditorAssetLibrary.load_asset(BP_DOOR)
-    eg = BEL.find_event_graph(bp)
-    g = G(bp, eg)
-    own = list(BEL.list_member_variable_names(bp, True))
-    for need in ('bLocked', 'KeyID', 'bOpen', 'OpenAngle'):
-        if need not in own:
-            raise RuntimeError('BP_Door missing variable %s (inspect first)' % need)
-    scene_ref = BEL.get_object_reference_type(unreal.SceneComponent)
-    ensure_var(bp, g, 'MJ_Leaf', scene_ref, '')
-    ensure_var(bp, g, 'MJ_BaseYaw', 'real', 0)
-    ensure_var(bp, g, 'MJ_CurrentYaw', 'real', 0)
 
-    mode = LEAF_MODE
-    comp = None
-    if mode.startswith('component:'):
-        comp = mode.split(':', 1)[1]
-    elif mode == 'auto':
-        comp = leaf_component_var(bp)
-    say('  leaf source:', ('component ' + comp) if comp else 'first attached actor root')
+DOOR_C = BP_DOOR + '.' + BP_DOOR.split('/')[-1] + '_C'
+KEY_C = BP_KEY + '.' + BP_KEY.split('/')[-1] + '_C'
+BPC_DOOR = '/Game/DirectorsCut/Blueprints/Components/BPC_MJDoor'
+BPC_KEY = '/Game/DirectorsCut/Blueprints/Components/BPC_MJKey'
 
-    # ---- BeginPlay: cache leaf + base yaw
-    g.x, g.y = 400, 200
-    cur = hook_event(bp, g, 'ReceiveBeginPlay', (0, 200))
-    if comp:
-        leaf_src = g.get(comp)
+
+def fresh_component_bp(path):
+    if unreal.EditorAssetLibrary.does_asset_exist(path) or unreal.find_object(None, path + '.' + path.split('/')[-1]):
+        c = unreal.load_object(None, path + '.' + path.split('/')[-1])
     else:
-        att = g.fn(ACT + 'GetAttachedActors')
-        if is_impure(att):
-            g.chain(cur, att)
-            cur = g.then(att)
-        arr_get = g.by_menu(['Utilities|Array|Get (a copy)', 'Utilities|Array|Get'], ['Array', 'Get'])
-        g.connect(att.find_output_pin('OutActors'), arr_get.find_input_pin_by_index(0), 'array get')
-        idx = arr_get.find_input_pin_by_index(1)
-        if idx.is_valid():
-            idx.set_pin_value('0')
-        leaf_src = g.fn(ACT + 'K2_GetRootComponent', self=arr_get.find_output_pin_by_index(0))
-    s1 = g.chain(cur, g.setv('MJ_Leaf', leaf_src))
-    leaf = g.get('MJ_Leaf')
-    rr = g.get('RelativeRotation', '/Script/Engine.SceneComponent', target=g.pin_out(leaf))
-    brk = g.fn(KML + 'BreakRotator', InRot=rr)
-    start = g.fn(KML + 'SelectFloat', A=g.get('OpenAngle'), B='0', bPickA=g.get('bOpen'))
-    base = g.fn(KML + 'Subtract_DoubleDouble', A=(brk, 'Yaw'), B=start)
-    s2 = g.chain(g.then(s1), g.setv('MJ_BaseYaw', base))
+        c = BEL.create_blueprint_asset_with_parent(path, unreal.ActorComponent)
+    eg = BEL.find_event_graph(c)
+    ed = BGE.get_graph_editor(eg)
+    old = [n for n in ed.list_all_nodes()]
+    if old:
+        ed.remove_nodes(old)   # our own generated component graph only
+    return c, G(c, eg)
+
+
+def ensure_proxy_var(bp):
+    if 'MJ_Proxy' not in list(BEL.list_member_variable_names(bp, True)):
+        ok = BEL.add_member_variable(bp, 'MJ_Proxy', BEL.get_object_reference_type(unreal.Actor))
+        BEL.set_blueprint_variable_instance_editable(bp, 'MJ_Proxy', True)
+        BEL.set_blueprint_variable_category(bp, 'MJ_Proxy', unreal.Text('MJ'))
+        say('  + BP var MJ_Proxy', ok)
+
+
+def ensure_component(bp, comp_bp):
+    sub = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    lib = unreal.SubobjectDataBlueprintFunctionLibrary
+    handles = sub.k2_gather_subobject_data_for_blueprint(bp)
+    gc = comp_bp.generated_class()
+    for h in handles:
+        o = lib.get_associated_object(lib.get_data(h)) if hasattr(lib, 'get_associated_object') else lib.get_object(lib.get_data(h))
+        if o is not None and o.get_class() == gc:
+            say('  component already on', bp.get_name())
+            return True
+    params = unreal.AddNewSubobjectParams(parent_handle=handles[0], new_class=gc, blueprint_context=bp)
+    res = sub.add_new_subobject(params)
+    say('  add component ->', res)
+    return True
+
+
+def owner_cast(g, cast_name, var):
+    """BeginPlay: cast GetOwner to the BP and store it in var. Returns exec-out pin of the setter."""
+    own = g.fn(ACT.replace('Actor.', 'ActorComponent.') + 'GetOwner')
+    cast = g.by_menu([cast_name], [cast_name.split('|')[-1]])
+    g.connect(g.pin_out(own), cast.find_input_pin('Object'), 'owner->cast')
+    return cast
+
+
+def build_door_component():
+    say('\n== BPC_MJDoor (logic for BP_Door)')
+    door = unreal.EditorAssetLibrary.load_asset(BP_DOOR)
+    ensure_proxy_var(door)
+    BEL.compile_blueprint(door)
+    c, g = fresh_component_bp(BPC_DOOR)
+    ensure_var(c, g, 'MJ_Door', BEL.get_object_reference_type(door.generated_class()), '')
+    ensure_var(c, g, 'MJ_BaseYaw', 'real', 0)
+    ensure_var(c, g, 'MJ_CurrentYaw', 'real', 0)
+
+    # BeginPlay: MJ_Door = Cast(GetOwner); base yaw from proxy
+    g.x, g.y = 400, 200
+    bp_ev = BEL.add_event_override(c, 'ReceiveBeginPlay', unreal.IntPoint(0, 200))
+    cast = owner_cast(g, 'Utilities|Casting|CastToBP_Door', 'MJ_Door')
+    g.chain(bp_ev.find_then_pin(), cast)
+    s0 = g.chain(g.then(cast), g.setv('MJ_Door', cast.find_output_pin_by_index(1) if not cast.find_output_pin('AsBP Door').is_valid() else cast.find_output_pin('AsBP Door')))
+    D = lambda: g.pin_out(g.get('MJ_Door'))
+    px = g.get('MJ_Proxy', DOOR_C, target=D())
+    b0 = g.chain(g.then(s0), g.branch(g.fn(KSL + 'IsValid', Object=px)))
+    brk = g.fn(KML + 'BreakRotator', InRot=g.fn(ACT + 'K2_GetActorRotation', self=g.pin_out(px)))
+    start = g.fn(KML + 'SelectFloat', A=g.get('OpenAngle', DOOR_C, target=D()), B='0', bPickA=g.get('bOpen', DOOR_C, target=D()))
+    s2 = g.chain(g.then(b0), g.setv('MJ_BaseYaw', g.fn(KML + 'Subtract_DoubleDouble', A=(brk, 'Yaw'), B=start)))
     g.chain(g.then(s2), g.setv('MJ_CurrentYaw', start))
 
-    # ---- Tick: swing + interact
+    # Tick
     g.x, g.y = 400, 900
-    tick_out = hook_event(bp, g, 'ReceiveTick', (0, 900))
-    tick_node = g.ed.find_event_node('ReceiveTick')
-    dt = tick_node.find_output_pin('DeltaSeconds')
-    tgt = g.fn(KML + 'SelectFloat', A=g.get('OpenAngle'), B='0', bPickA=g.get('bOpen'))
+    tk = BEL.add_event_override(c, 'ReceiveTick', unreal.IntPoint(0, 900))
+    dt = tk.find_output_pin('DeltaSeconds')
+    bd = g.chain(tk.find_then_pin(), g.branch(g.fn(KSL + 'IsValid', Object=g.get('MJ_Door'))))
+    tgt = g.fn(KML + 'SelectFloat', A=g.get('OpenAngle', DOOR_C, target=D()), B='0', bPickA=g.get('bOpen', DOOR_C, target=D()))
     interp = g.fn(KML + 'FInterpTo', Current=g.get('MJ_CurrentYaw'), Target=tgt, DeltaTime=dt, InterpSpeed=str(SWING_SPEED))
-    s3 = g.chain(tick_out, g.setv('MJ_CurrentYaw', interp))
-    leaf2 = g.get('MJ_Leaf')
-    valid = g.fn(KSL + 'IsValid', Object=leaf2)
-    b_valid = g.chain(g.then(s3), g.branch(valid))
-    rr2 = g.get('RelativeRotation', '/Script/Engine.SceneComponent', target=g.pin_out(leaf2))
-    brk2 = g.fn(KML + 'BreakRotator', InRot=rr2)
+    s3 = g.chain(g.then(bd), g.setv('MJ_CurrentYaw', interp))
+    px2 = g.get('MJ_Proxy', DOOR_C, target=D())
+    bv = g.chain(g.then(s3), g.branch(g.fn(KSL + 'IsValid', Object=px2)))
+    brk2 = g.fn(KML + 'BreakRotator', InRot=g.fn(ACT + 'K2_GetActorRotation', self=g.pin_out(px2)))
     yaw = g.fn(KML + 'Add_DoubleDouble', A=g.get('MJ_BaseYaw'), B=g.get('MJ_CurrentYaw'))
     mk = g.fn(KML + 'MakeRotator', Roll=(brk2, 'Roll'), Pitch=(brk2, 'Pitch'), Yaw=yaw)
-    setrot = g.fn('/Script/Engine.SceneComponent.K2_SetRelativeRotation', self=g.pin_out(leaf2), NewRotation=mk)
-    g.chain(g.then(b_valid), setrot)
+    setrot = g.chain(g.then(bv), g.fn(ACT + 'K2_SetActorRotation', self=g.pin_out(px2), NewRotation=mk))
 
-    bounds = g.fn(KSL + 'GetComponentBounds', Component=g.pin_out(leaf2))
-    want, pawn = near_and_facing(g, bounds.find_output_pin('Origin'), DOOR_DIST, DOOR_FACING)
-    b_int = g.chain(g.then(setrot), g.branch(want))
-    b_lock = g.chain(g.then(b_int), g.branch(g.get('bLocked')))
-    tag = key_tag_name(g, g.get('KeyID'))
-    has = g.fn(ACT + 'ActorHasTag', self=pawn, Tag=tag)
-    b_key = g.chain(g.then(b_lock), g.branch(has))
-    # locked + no key
-    g.chain(b_key.find_else_pin(), print_msg(g, 'Kilitli', 1, 0.25, 0.2))
-    # locked + key -> unlock -> message -> toggle
-    unl = g.chain(g.then(b_key), g.setv('bLocked', 'false'))
+    me = g.fn(ACT + 'K2_GetActorLocation', self=D())
+    want, pawn = near_and_facing(g, g.pin_out(me), DOOR_DIST, DOOR_FACING)
+    bi = g.branch(want)
+    g.chain(g.then(setrot), bi)
+    g.chain(bv.find_else_pin(), bi)
+    bl = g.chain(g.then(bi), g.branch(g.get('bLocked', DOOR_C, target=D())))
+    tag = key_tag_name(g, g.get('KeyID', DOOR_C, target=D()))
+    bk = g.chain(g.then(bl), g.branch(g.fn(ACT + 'ActorHasTag', self=pawn, Tag=tag)))
+    g.chain(bk.find_else_pin(), print_msg(g, 'Kilitli', 1, 0.25, 0.2))
+    unl = g.chain(g.then(bk), g.setv('bLocked', 'false', DOOR_C, target=D()))
     msg = g.chain(g.then(unl), print_msg(g, 'Kilit acildi', 0.4, 1, 0.4))
-    notb = g.fn(KML + 'Not_PreBool', A=g.get('bOpen'))
-    tog = g.setv('bOpen', notb)
+    tog = g.setv('bOpen', g.fn(KML + 'Not_PreBool', A=g.get('bOpen', DOOR_C, target=D())), DOOR_C, target=D())
     g.chain(g.then(msg), tog)
-    g.chain(b_lock.find_else_pin(), tog)          # unlocked -> toggle
-    return finish(bp, BP_DOOR)
+    g.chain(bl.find_else_pin(), tog)
+    return c, door
 
 
-def build_key():
-    say('\n== BP_Key')
-    bp = unreal.EditorAssetLibrary.load_asset(BP_KEY)
-    eg = BEL.find_event_graph(bp)
-    g = G(bp, eg)
-    if 'KeyID' not in list(BEL.list_member_variable_names(bp, True)):
-        raise RuntimeError('BP_Key missing KeyID (inspect first)')
-    ensure_var(bp, g, 'MJ_Taken', 'bool', 'false')
+def build_key_component():
+    say('\n== BPC_MJKey (logic for BP_Key)')
+    key = unreal.EditorAssetLibrary.load_asset(BP_KEY)
+    ensure_proxy_var(key)
+    BEL.compile_blueprint(key)
+    c, g = fresh_component_bp(BPC_KEY)
+    ensure_var(c, g, 'MJ_Key', BEL.get_object_reference_type(key.generated_class()), '')
+    ensure_var(c, g, 'MJ_Taken', 'bool', 'false')
+    g.x, g.y = 400, 200
+    bp_ev = BEL.add_event_override(c, 'ReceiveBeginPlay', unreal.IntPoint(0, 200))
+    cast = owner_cast(g, 'Utilities|Casting|CastToBP_Key', 'MJ_Key')
+    g.chain(bp_ev.find_then_pin(), cast)
+    g.chain(g.then(cast), g.setv('MJ_Key', cast.find_output_pin_by_index(1) if not cast.find_output_pin('AsBP Key').is_valid() else cast.find_output_pin('AsBP Key')))
+    K = lambda: g.pin_out(g.get('MJ_Key'))
     g.x, g.y = 400, 900
-    tick_out = hook_event(bp, g, 'ReceiveTick', (0, 900))
-    loc = g.fn(ACT + 'K2_GetActorLocation')
+    tk = BEL.add_event_override(c, 'ReceiveTick', unreal.IntPoint(0, 900))
+    valid = g.fn(KSL + 'IsValid', Object=g.get('MJ_Key'))
+    bd = g.chain(tk.find_then_pin(), g.branch(valid))
+    loc = g.fn(ACT + 'K2_GetActorLocation', self=K())
     want, pawn = near_and_facing(g, g.pin_out(loc), KEY_DIST, KEY_FACING)
-    nt = g.fn(KML + 'Not_PreBool', A=g.get('MJ_Taken'))
-    cond = g.fn(KML + 'BooleanAND', A=want, B=nt)
-    b = g.chain(tick_out, g.branch(cond))
+    cond = g.fn(KML + 'BooleanAND', A=want, B=g.fn(KML + 'Not_PreBool', A=g.get('MJ_Taken')))
+    b = g.chain(g.then(bd), g.branch(cond))
     tags = g.get('Tags', '/Script/Engine.Actor', target=g.pin_out(pawn))
-    add = g.by_menu(['Utilities|Array|Add'], ['Array', 'Add'])
-    g.connect(g.pin_out(tags), add.find_input_pin_by_index(1) if not add.find_input_pin('TargetArray').is_valid() else add.find_input_pin('TargetArray'), 'tags->add')
-    tag = key_tag_name(g, g.get('KeyID'))
-    item = add.find_input_pin('NewItem')
-    g.connect(g.pin_out(tag), item, 'tag->add')
+    add = g.by_menu(['Utilities|Array|AddUnique', 'Utilities|Array|Add'], ['Array', 'Add'])
+    g.connect(g.pin_out(tags), add.find_input_pin('TargetArray'), 'tags->add')
+    tag = key_tag_name(g, g.get('KeyID', KEY_C, target=K()))
+    g.connect(g.pin_out(tag), add.find_input_pin('NewItem'), 'tag->add')
     g.chain(g.then(b), add)
     s = g.chain(g.then(add), g.setv('MJ_Taken', 'true'))
     m = g.chain(g.then(s), print_msg(g, 'Anahtar alindi', 1, 0.85, 0.2))
-    h = g.chain(g.then(m), g.fn(ACT + 'SetActorHiddenInGame', bNewHidden='true'))
-    g.chain(g.then(h), g.fn(ACT + 'SetActorEnableCollision', bNewActorEnableCollision='false'))
-    return finish(bp, BP_KEY)
+    h = g.chain(g.then(m), g.fn(ACT + 'SetActorHiddenInGame', self=K(), bNewHidden='true'))
+    cc = g.chain(g.then(h), g.fn(ACT + 'SetActorEnableCollision', self=K(), bNewActorEnableCollision='false'))
+    kp = g.get('MJ_Proxy', KEY_C, target=K())
+    bk = g.chain(g.then(cc), g.branch(g.fn(KSL + 'IsValid', Object=kp)))
+    h2 = g.chain(g.then(bk), g.fn(ACT + 'SetActorHiddenInGame', self=g.pin_out(kp), bNewHidden='true'))
+    g.chain(g.then(h2), g.fn(ACT + 'SetActorEnableCollision', self=g.pin_out(kp), bNewActorEnableCollision='false'))
+    return c, key
+
+
+def compile_report(bp):
+    ok = BEL.compile_blueprint(bp)
+    errs = []
+    for gr in BEL.list_graphs(bp):
+        ed = BGE.get_graph_editor(gr)
+        if ed is None:
+            continue
+        for n in ed.list_nodes_with_errors():
+            errs.append('%s: %s' % (n.get_node_title(), n.get_editor_property('error_msg')))
+    say('compile', bp.get_name(), ok, 'errors:', errs[:10])
+    return ok and not errs
+
+
+def pkg_dirty(path):
+    names = [x.get_name() for x in unreal.EditorLoadingAndSavingUtils.get_dirty_content_packages()]
+    return path in names
+
+
+def link_proxies():
+    """Editor data only: MJ_Proxy on each door/key -> its Proxy_<label> mesh actor; door leaf
+    proxies set Movable so they can swing at runtime. Nothing is moved."""
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    acts = eas.get_all_level_actors()
+    by_label = dict((a.get_actor_label(), a) for a in acts)
+    n = 0
+    miss = []
+    for a in acts:
+        cn = a.get_class().get_name()
+        if not (cn.startswith('BP_Door') or cn.startswith('BP_Key')):
+            continue
+        prox = by_label.get('Proxy_' + a.get_actor_label())
+        if prox is None:
+            miss.append(a.get_actor_label())
+            continue
+        a.set_editor_property('MJ_Proxy', prox)
+        rc = prox.get_editor_property('root_component')
+        if rc and cn.startswith('BP_Door'):
+            rc.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
+        n += 1
+    say('linked proxies', n, 'missing', miss)
+    return n
 
 
 if not hasattr(unreal, 'BlueprintGraphEditor'):
-    raise RuntimeError('BlueprintGraphEditor API not available in this editor - nothing changed.')
+    raise RuntimeError('BlueprintGraphEditor API not available - nothing changed.')
+lvl = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world().get_path_name().split('.')[0]
+if not lvl.endswith('L_Building'):
+    raise RuntimeError('open level is %s, not L_Building' % lvl)
+for path in (BP_DOOR, BP_KEY):
+    if pkg_dirty(path) and 'MJ_Proxy' not in list(BEL.list_member_variable_names(unreal.EditorAssetLibrary.load_asset(path), False)):
+        raise RuntimeError('%s has unsaved edits (not ours) - stopping, nothing changed' % path)
+if not DRY_RUN:
+    for path in (BP_DOOR, BP_KEY):
+        if not backup(path):  # note: duplicate of the in-memory asset; MJ_Proxy (unused var) may already be in it
+            raise RuntimeError('backup failed for ' + path)
+
 results = {}
-for path, fn in ((BP_DOOR, build_door), (BP_KEY, build_key)):
+for name, fn in (('door', build_door_component), ('key', build_key_component)):
     FAIL[:] = []
-    if not DRY_RUN and not backup(path):
-        say('backup failed, skipping', path)
-        results[path] = False
-        continue
     try:
-        results[path] = fn()
+        comp, owner_bp = fn()
+        ok_c = compile_report(comp)
+        if FAIL:
+            say('wiring problems:', FAIL[:25])
+        ok = ok_c and not FAIL
+        if ok:
+            ensure_component(owner_bp, comp)
+            ok = compile_report(owner_bp)
+        results[name] = ok
+        if ok and not DRY_RUN:
+            unreal.EditorAssetLibrary.save_loaded_asset(comp, only_if_is_dirty=False)
+            unreal.EditorAssetLibrary.save_loaded_asset(owner_bp, only_if_is_dirty=False)
+            say('SAVED', comp.get_name(), owner_bp.get_name())
     except Exception as e:
-        say('ERROR', path, e)
-        try:
-            unreal.EditorLoadingAndSavingUtils.reload_packages([unreal.EditorAssetLibrary.load_asset(path).get_outermost()])
-            say('DISCARDED (reloaded from disk)', path)
-        except Exception as e2:
-            say('reload failed', e2)
-        results[path] = False
-    if FAIL:
-        say('wiring problems:', FAIL[:25])
+        import traceback
+        say('ERROR', name, e, traceback.format_exc()[-600:])
+        results[name] = False
+
+if DRY_RUN or not all(results.values()):
+    # discard our in-memory edits to the (previously clean) owner Blueprints
+    say('nothing saved (dry run / failure). In-memory only: MJ_Proxy var on BP_Door/BP_Key, component BPs.')
+else:
+    say('map dirty before link (user edits will be saved too):',
+        [x.get_name() for x in unreal.EditorLoadingAndSavingUtils.get_dirty_map_packages()])
+    link_proxies()
+    say('level saved', unreal.EditorLevelLibrary.save_current_level())
 say('\nRESULT', results, '| DRY_RUN', DRY_RUN)

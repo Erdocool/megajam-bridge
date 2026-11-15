@@ -5,7 +5,7 @@
 import math
 import unreal
 
-EV_OUT = None        # outdoor EV100 to lock to; None = estimate from the sun intensity
+EV_OUT = 0.5         # outdoor EV100 (sun is only 2.5 lux -> grey-card estimate ~0.2 EV); None = estimate
 INTERIOR_RANGE = 3.0  # how many EV the image may still brighten indoors (0 = fully fixed exposure)
 SAVE = True
 
