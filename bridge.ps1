@@ -5,7 +5,10 @@
 # This script never calls getUpdates, so it does not conflict with other
 # consumers of the same bot token.
 # Default engine is Cursor CLI (cursor-agent). Set $MJ_ENGINE='claude' to use
-# Claude Code instead.
+# Claude Code instead. Set $MJ_ENGINE='exec' for NO AI agent: only '!py'
+# (UE Python in the open Unreal Editor via Python Remote Execution) and
+# '!pyurl <github-url>' messages are run, everything else gets a short note.
+# '!py' / '!pyurl' also work with the cursor/claude engines.
 # Usage (first run):
 #   $MJ_ENGINE='cursor'; $MJ_TOKEN='...'; $MJ_SECRET='...'; $MJ_PERMISSION='bypassPermissions'; irm <raw-url> | iex
 # Later runs (config already saved):
@@ -229,6 +232,9 @@ function Resolve-Config {
     $il  = Get-MJVar 'MJ_IN_LANG'
     $ol  = Get-MJVar 'MJ_OUT_LANG'
     $po  = Get-MJVar 'MJ_POLL'
+    $py  = Get-MJVar 'MJ_PYTHON'
+    if ([string]::IsNullOrWhiteSpace($py) -and $env:MEGAJAM_PYTHON) { $py = $env:MEGAJAM_PYTHON }
+    $script:PythonOverride = $py
 
     if ([string]::IsNullOrWhiteSpace($tok) -and $env:MEGAJAM_BOT_TOKEN) { $tok = $env:MEGAJAM_BOT_TOKEN }
     if ([string]::IsNullOrWhiteSpace($tok) -and $env:TELEGRAM_GROK_BOT_TOKEN) { $tok = $env:TELEGRAM_GROK_BOT_TOKEN }
@@ -283,7 +289,8 @@ function Resolve-Config {
     if ([string]::IsNullOrWhiteSpace($eng)) { $eng = 'cursor' }
     $eng = $eng.Trim().ToLower()
     if ($eng -eq 'cursor-agent' -or $eng -eq 'cursorcli' -or $eng -eq 'cursor-cli') { $eng = 'cursor' }
-    if ($eng -ne 'cursor' -and $eng -ne 'claude') {
+    if ($eng -eq 'raw' -or $eng -eq 'python' -or $eng -eq 'none' -or $eng -eq 'noai' -or $eng -eq 'ue') { $eng = 'exec' }
+    if ($eng -ne 'cursor' -and $eng -ne 'claude' -and $eng -ne 'exec') {
         Write-Live ("Bilinmeyen MJ_ENGINE='" + $eng + "', cursor kullanilacak.") 'Yellow'
         $eng = 'cursor'
     }
@@ -687,11 +694,17 @@ function Get-InboundNew {
 }
 
 function Get-MJEngineLabel {
+    if ($script:Engine -eq 'exec') { return 'Exec' }
     if ($script:Engine -eq 'cursor') { return 'Cursor' }
     return 'Claude'
 }
 
 function Get-MJEngineExe {
+    if ($script:Engine -eq 'exec') {
+        $pyExe = Resolve-MJPython
+        if ([string]::IsNullOrWhiteSpace($pyExe)) { return '(python bulunamadi - Unreal Editor acilinca tekrar aranir)' }
+        return $pyExe
+    }
     if ($script:Engine -eq 'cursor') { return $script:CursorExe }
     return $script:ClaudeExe
 }
@@ -832,6 +845,385 @@ function Invoke-MJCli([string]$Prompt) {
     return ('HATA: ' + $label + ' calistirilamadi.')
 }
 
+
+# ---------------------------------------------------------------------------
+# Exec mode: run UE Python in the open Unreal Editor without any AI agent.
+# The runner below is a stdlib-only Python Remote Execution client
+# (UDP 239.0.0.1:6766 discovery, TCP command channel on 127.0.0.1).
+# ---------------------------------------------------------------------------
+$script:MJRunnerSource = @'
+# MegaJam bridge: run a Python file inside the open Unreal Editor via
+# Python Remote Execution (UDP multicast discovery + TCP command channel).
+# Stdlib only, so it runs with the engine's bundled python.exe.
+# Usage: python mj_ue_exec.py <code_file> [timeout_sec] [project_hint]
+import json, os, socket, sys, time, uuid
+
+GROUP = ('239.0.0.1', 6766)
+MAGIC = 'ue_py'
+VERSION = 1
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+
+def mk(kind, src, dest=None, data=None):
+    m = {'version': VERSION, 'magic': MAGIC, 'type': kind, 'source': src}
+    if dest:
+        m['dest'] = dest
+    if data is not None:
+        m['data'] = data
+    return json.dumps(m, ensure_ascii=False).encode('utf-8')
+
+
+def parse(raw):
+    try:
+        m = json.loads(raw.decode('utf-8'))
+    except Exception:
+        return None
+    if not isinstance(m, dict) or m.get('magic') != MAGIC:
+        return None
+    return m
+
+
+def open_udp(bind_addr):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    if hasattr(socket, 'SO_REUSEPORT'):
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    else:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((bind_addr, GROUP[1]))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 0)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                 socket.inet_aton(GROUP[0]) + socket.inet_aton(bind_addr))
+    s.settimeout(0.2)
+    return s
+
+
+def discover(udp, me, seconds):
+    nodes = {}
+    end = time.time() + seconds
+    next_ping = 0.0
+    while time.time() < end:
+        if time.time() >= next_ping:
+            udp.sendto(mk('ping', me), GROUP)
+            next_ping = time.time() + 1.0
+        try:
+            raw, _ = udp.recvfrom(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            continue
+        m = parse(raw)
+        if not m or m.get('source') == me or m.get('type') != 'pong':
+            continue
+        nodes[m['source']] = m.get('data') or {}
+        # small grace period to collect other editors, then stop
+        end = min(end, time.time() + 0.6)
+    return nodes
+
+
+def pick(nodes, hint):
+    if not nodes:
+        return None, None
+    if hint:
+        h = hint.lower()
+        for nid, d in nodes.items():
+            if h in str(d.get('project_name', '')).lower() or h in str(d.get('project_root', '')).lower():
+                return nid, d
+    nid = sorted(nodes.keys())[0]
+    return nid, nodes[nid]
+
+
+def recv_json(conn, timeout):
+    conn.settimeout(timeout)
+    buf = b''
+    while True:
+        chunk = conn.recv(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+        m = parse(buf)
+        if m is not None:
+            return m
+    return parse(buf)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print('usage: mj_ue_exec.py <code_file> [timeout_sec] [project_hint]')
+        return 64
+    path = sys.argv[1]
+    timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 600.0
+    hint = sys.argv[3] if len(sys.argv) > 3 else 'DirectorsCut'
+    with open(path, 'rb') as f:
+        code = f.read().decode('utf-8-sig')
+
+    me = str(uuid.uuid4())
+    binds = [os.environ.get('MJ_UE_BIND') or '0.0.0.0']
+    if '127.0.0.1' not in binds:
+        binds.append('127.0.0.1')
+
+    udp = None
+    nodes = {}
+    for b in binds:
+        try:
+            udp = open_udp(b)
+        except OSError as e:
+            print('[UE] multicast bind %s failed: %s' % (b, e))
+            udp = None
+            continue
+        nodes = discover(udp, me, 4.0)
+        if nodes:
+            break
+        udp.close()
+        udp = None
+    if not nodes:
+        print('[UE] HATA: Unreal Editor bulunamadi. Editor acik mi, Python Remote Execution acik mi?')
+        return 3
+
+    nid, info = pick(nodes, hint)
+    print('[UE] editor: %s | %s | %s' % (info.get('project_name', '?'), info.get('engine_version', '?'), info.get('machine', '?')))
+
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lst.bind(('127.0.0.1', 0))
+    lst.listen(1)
+    lst.settimeout(1.0)
+    port = lst.getsockname()[1]
+    conn = None
+    end = time.time() + 8.0
+    while conn is None and time.time() < end:
+        udp.sendto(mk('open_connection', me, nid, {'command_ip': '127.0.0.1', 'command_port': port}), GROUP)
+        try:
+            conn, _ = lst.accept()
+        except socket.timeout:
+            conn = None
+    if conn is None:
+        print('[UE] HATA: editor komut baglantisini acmadi.')
+        udp.close()
+        return 4
+
+    rc = 0
+    try:
+        conn.settimeout(30)
+        conn.sendall(mk('command', me, nid, {'command': code, 'unattended': True, 'exec_mode': 'ExecuteFile'}))
+        res = recv_json(conn, timeout)
+        if not res:
+            print('[UE] HATA: bos yanit')
+            rc = 5
+        else:
+            d = res.get('data') or {}
+            for o in d.get('output') or []:
+                kind = o.get('type', 'Info')
+                text = str(o.get('output', '')).rstrip('\n')
+                print(text if kind == 'Info' else '[%s] %s' % (kind, text))
+            ok = bool(d.get('success'))
+            result = d.get('result')
+            if result not in (None, '', 'None'):
+                print('[UE] result: %s' % result)
+            print('[UE] success=%s' % ok)
+            rc = 0 if ok else 2
+    except socket.timeout:
+        print('[UE] HATA: %s sn icinde yanit gelmedi (editor hala calisiyor olabilir).' % int(timeout))
+        rc = 6
+    finally:
+        try:
+            udp.sendto(mk('close_connection', me, nid), GROUP)
+        except Exception:
+            pass
+        for s in (conn, lst, udp):
+            try:
+                s.close()
+            except Exception:
+                pass
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+
+'@
+
+$script:MJPyUrlPrefixes = @(
+    'https://raw.githubusercontent.com/Erdocool/',
+    'https://github.com/Erdocool/',
+    'https://gist.githubusercontent.com/Erdocool/'
+)
+
+function Get-MJExecDir {
+    $d = Join-Path (Get-ConfigDir) 'exec'
+    if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    return $d
+}
+
+function Ensure-MJRunner {
+    $dir = Get-ConfigDir
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $path = Join-Path $dir 'mj_ue_exec.py'
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($path, $script:MJRunnerSource, $utf8)
+    return $path
+}
+
+function Get-MJEnginePython([string]$EngineDir) {
+    if ([string]::IsNullOrWhiteSpace($EngineDir)) { return $null }
+    $c = Join-Path $EngineDir 'Binaries\ThirdParty\Python3\Win64\python.exe'
+    if (Test-Path -LiteralPath $c) { return $c }
+    $c = Join-Path $EngineDir 'Engine\Binaries\ThirdParty\Python3\Win64\python.exe'
+    if (Test-Path -LiteralPath $c) { return $c }
+    return $null
+}
+
+function Resolve-MJPython {
+    if (-not [string]::IsNullOrWhiteSpace($script:PythonOverride) -and (Test-Path -LiteralPath $script:PythonOverride)) {
+        return $script:PythonOverride
+    }
+    # 1) The python.exe bundled with the running Unreal Editor
+    try {
+        $procs = @(Get-Process -Name 'UnrealEditor' -ErrorAction SilentlyContinue)
+        foreach ($pr in $procs) {
+            $exePath = $null
+            try { $exePath = $pr.Path } catch {}
+            if ([string]::IsNullOrWhiteSpace($exePath)) { continue }
+            $engDir = Split-Path (Split-Path (Split-Path $exePath -Parent) -Parent) -Parent
+            $c = Get-MJEnginePython $engDir
+            if ($c) { return $c }
+        }
+    } catch {}
+    # 2) Installed engines from the registry (newest first)
+    try {
+        $keys = @(Get-ChildItem 'HKLM:\SOFTWARE\EpicGames\Unreal Engine' -ErrorAction SilentlyContinue | Sort-Object PSChildName -Descending)
+        foreach ($k in $keys) {
+            $inst = $null
+            try { $inst = (Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue).InstalledDirectory } catch {}
+            if ([string]::IsNullOrWhiteSpace($inst)) { continue }
+            $c = Get-MJEnginePython (Join-Path $inst 'Engine')
+            if ($c) { return $c }
+        }
+    } catch {}
+    # 3) Default Epic Games locations
+    foreach ($v in @('UE_5.8', 'UE_5.7', 'UE_5.6', 'UE_5.5')) {
+        foreach ($root in @($env:ProgramFiles, 'C:\Program Files', 'D:\Epic Games', 'C:\Epic Games')) {
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+            $base = $root
+            if ($root -notmatch '(?i)Epic Games$') { $base = Join-Path $root 'Epic Games' }
+            $c = Get-MJEnginePython (Join-Path (Join-Path $base $v) 'Engine')
+            if ($c) { return $c }
+        }
+    }
+    # 4) A normal Python on PATH (skip the Microsoft Store stub)
+    foreach ($n in @('py.exe', 'python.exe', 'python3.exe')) {
+        try {
+            $cmd = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cmd -and $cmd.Source -and ($cmd.Source -notmatch '(?i)\\WindowsApps\\')) { return $cmd.Source }
+        } catch {}
+    }
+    return $null
+}
+
+function Limit-MJText([string]$Text, [int]$Max) {
+    if ([string]::IsNullOrEmpty($Text) -or $Text.Length -le $Max) { return $Text }
+    $head = [int]($Max * 0.3)
+    $tail = $Max - $head
+    return $Text.Substring(0, $head) + "`n...[" + ($Text.Length - $Max) + " karakter kesildi]...`n" + $Text.Substring($Text.Length - $tail)
+}
+
+function Invoke-MJUePython([string]$Code, [string]$Source) {
+    $pyExe = Resolve-MJPython
+    if ([string]::IsNullOrWhiteSpace($pyExe)) {
+        return 'HATA: python bulunamadi (Unreal Editor acik mi? Gerekirse $MJ_PYTHON ile python.exe yolunu verin).'
+    }
+    $runner = Ensure-MJRunner
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+    $codeFile = Join-Path (Get-MJExecDir) ('in_' + $stamp + '.py')
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($codeFile, $Code, $utf8)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $pyExe
+    $pre = ''
+    if ([System.IO.Path]::GetFileName($pyExe) -ieq 'py.exe') { $pre = '-3 ' }
+    $psi.Arguments = $pre + '-u "' + $runner + '" "' + $codeFile + '" ' + [string]$script:TimeoutSec + ' DirectorsCut'
+    $psi.WorkingDirectory = $script:WorkDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    try { $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8' } catch {}
+    try { $psi.EnvironmentVariables['PYTHONUTF8'] = '1' } catch {}
+
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $tOut = $p.StandardOutput.ReadToEndAsync()
+    $tErr = $p.StandardError.ReadToEndAsync()
+    $waitMs = ($script:TimeoutSec + 30) * 1000
+    if (-not $p.WaitForExit($waitMs)) {
+        try { $p.Kill() } catch {}
+        return ('HATA: UE python ' + $script:TimeoutSec + ' saniyede bitmedi, istemci durduruldu (editor icindeki is surebilir).')
+    }
+    try { [void]$tOut.Wait(15000) } catch {}
+    try { [void]$tErr.Wait(15000) } catch {}
+    $stdout = ''
+    $stderr = ''
+    try { $stdout = [string]$tOut.Result } catch {}
+    try { $stderr = [string]$tErr.Result } catch {}
+    $out = ('[exec ' + $Source + ' | cikis ' + $p.ExitCode + ' | ' + [System.IO.Path]::GetFileName($codeFile) + "]`n" + $stdout.TrimEnd())
+    if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+        $out = $out + "`n--- stderr ---`n" + $stderr.Trim()
+    }
+    return (Limit-MJText $out 50000)
+}
+
+function Test-MJPyUrl([string]$Url) {
+    foreach ($pfx in $script:MJPyUrlPrefixes) {
+        if ($Url.StartsWith($pfx, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# Returns $null when the message is not an exec command, otherwise the reply.
+function Try-MJExecCommand([string]$Prompt) {
+    $text = $Prompt.Replace("`r`n", "`n").TrimStart()
+    $nl = $text.IndexOf("`n")
+    if ($nl -ge 0) { $first = $text.Substring(0, $nl).Trim(); $rest = $text.Substring($nl + 1) } else { $first = $text.Trim(); $rest = '' }
+    $firstClean = ($first -replace '\s*#\s*$', '').Trim()
+
+    if ($firstClean -match '^(?i)!pyurl\s+(\S+)$') {
+        $url = $Matches[1]
+        if (-not (Test-MJPyUrl $url)) {
+            return ('HATA: !pyurl sadece su adreslerden indirir: ' + ($script:MJPyUrlPrefixes -join ', '))
+        }
+        try {
+            $code = Invoke-WebUtf8 -Url $url -Method 'GET' -TimeoutMs 60000
+        } catch {
+            return ('HATA: script indirilemedi: ' + (Hide-Secret $_.Exception.Message))
+        }
+        if ([string]::IsNullOrWhiteSpace($code)) { return 'HATA: indirilen script bos.' }
+        return (Invoke-MJUePython $code $url)
+    }
+    if ($firstClean -match '^(?i)!py$') {
+        if ([string]::IsNullOrWhiteSpace($rest)) { return 'HATA: !py satirindan sonra Python kodu yok.' }
+        return (Invoke-MJUePython $rest 'inline')
+    }
+    if ($firstClean -match '^(?i)!py\s+(.+)$') {
+        # one-liner: !py print(1)
+        $one = ($first -replace '^(?i)!py\s+', '')
+        if (-not [string]::IsNullOrWhiteSpace($rest)) { $one = $one + "`n" + $rest }
+        return (Invoke-MJUePython $one 'inline')
+    }
+    return $null
+}
+
 function Show-Banner {
     $label = Get-MJEngineLabel
     $exe = Get-MJEngineExe
@@ -847,7 +1239,10 @@ function Show-Banner {
     }
     Write-Host ('  Izin   : ' + $script:PermissionMode)
     Write-Host '  Transport: Telegram Bot API (anlik, getUpdates yok)'
-    if ($script:Engine -eq 'cursor') {
+    if ($script:Engine -eq 'exec') {
+        Write-Host '  Exec: yapay zeka YOK. Sadece !py / !pyurl mesajlari'
+        Write-Host '        acik Unreal Editor''da Python olarak calisir.'
+    } elseif ($script:Engine -eq 'cursor') {
         Write-Host '  Cursor: --print --continue --output-format text'
         if (Test-MJAutoApprove) {
             Write-Host '          --force --trust --approve-mcps --sandbox disabled'
@@ -860,7 +1255,7 @@ function Show-Banner {
         Write-Host '           Bash vs. hala onay isteyebilir; takilirsa'
         Write-Host '           config''te PermissionMode = bypassPermissions yapin.'
     }
-    if (-not (Test-Path -LiteralPath $exe)) {
+    if ($script:Engine -ne 'exec' -and -not (Test-Path -LiteralPath $exe)) {
         Write-Host ('  UYARI: ' + $label + ' bulunamadi. Yolu kontrol edin.') -ForegroundColor Yellow
     }
     Write-Host '========================================' -ForegroundColor Cyan
@@ -880,6 +1275,28 @@ function Handle-Message([string]$Prompt) {
         Write-Host ('----- KOPRU [' + (Get-Date -Format 'HH:mm:ss') + '] -----') -ForegroundColor Green
         Write-Host $reply
         Send-Outbound $reply
+        return
+    }
+
+    $execReply = $null
+    try {
+        $execReply = Try-MJExecCommand $Prompt
+    } catch {
+        $execReply = 'HATA: exec basarisiz: ' + (Hide-Secret $_.Exception.Message)
+    }
+    if ($execReply -ne $null) {
+        Write-Host ('----- EXEC  [' + (Get-Date -Format 'HH:mm:ss') + '] -----') -ForegroundColor Green
+        Write-Host $execReply
+        Write-Host ''
+        Send-Outbound $execReply
+        Write-Host 'Dinleniyor...' -ForegroundColor Green
+        return
+    }
+    if ($script:Engine -eq 'exec') {
+        $reply = 'Exec modu: yapay zeka kapali. Komutlar: !ping, "!py" + yeni satirda Python kodu, "!pyurl <github-raw-url>".'
+        Write-Host $reply -ForegroundColor Yellow
+        Send-Outbound $reply
+        Write-Host 'Dinleniyor...' -ForegroundColor Green
         return
     }
 

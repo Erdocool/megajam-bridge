@@ -54,7 +54,8 @@ If a local `config.json` already exists and has no `Engine` field, the script de
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `$MJ_ENGINE` | `cursor` | `cursor` or `claude` |
+| `$MJ_ENGINE` | `cursor` | `cursor`, `claude`, or `exec` (no AI agent; see below) |
+| `$MJ_PYTHON` | (auto) | Exec mode: python.exe used to reach Unreal. Default: the Python bundled with the running Unreal Editor |
 | `$MJ_TOKEN` | (required once) | Telegram bot token |
 | `$MJ_SECRET` | (required once) | Shared secret; messages that do not decrypt are ignored |
 | `$MJ_PERMISSION` | `acceptEdits` | Claude: `--permission-mode`. Cursor: `bypassPermissions` (or `force` / `yolo`) adds `--force --trust --approve-mcps --sandbox disabled` |
@@ -68,6 +69,19 @@ If a local `config.json` already exists and has no `Engine` field, the script de
 | `$MJ_OUT_LANG` | `eo` | Telegram description language slot for replies |
 
 Environment variables `MEGAJAM_ENGINE`, `MEGAJAM_BOT_TOKEN`, `TELEGRAM_GROK_BOT_TOKEN`, `MEGAJAM_SECRET`, `MEGAJAM_WORKDIR`, `MEGAJAM_CURSOR`, `MEGAJAM_CLAUDE`, `MEGAJAM_MODEL`, and `MEGAJAM_PERMISSION` work too.
+
+
+## Exec mode (no AI agent, free)
+
+Start with `$MJ_ENGINE='exec'`. Nothing calls Cursor or Claude. Only these messages do something:
+
+- `!ping` - health check
+- `!py` on the first line, Python code on the following lines - the code runs inside the open Unreal Editor through Python Remote Execution (Project Settings > Python > Enable Remote Execution must be on). Its printed output comes back as the reply.
+- `!pyurl <url>` - downloads a `.py` from `https://raw.githubusercontent.com/Erdocool/...`, `https://github.com/Erdocool/...` or `https://gist.githubusercontent.com/Erdocool/...` and runs it the same way.
+
+Any other message gets a short note. `!py` and `!pyurl` also work with the `cursor` and `claude` engines.
+
+The client is a small stdlib-only script written to `%USERPROFILE%\.megajam-bridge\mj_ue_exec.py`. It runs with the `python.exe` bundled with the running Unreal Editor. Each received script is kept in `%USERPROFILE%\.megajam-bridge\exec\`. The editor connection is local (`127.0.0.1`, multicast `239.0.0.1:6766`).
 
 ## Agent flags
 
